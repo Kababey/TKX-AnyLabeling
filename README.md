@@ -94,6 +94,21 @@
 - `2026-03-01`: Completed the PyQt5-to-PyQt6 upgrade refactor (Beta release), along with additional feature fixes and optimizations.
 - For more details, please refer to the [CHANGELOG](./CHANGELOG.md)
 
+## Quick Install
+
+> Placeholder: replace `Kababey` with your actual GitHub username/org before publishing.
+
+Install and run this fork without cloning the source. Requires Python 3.11+.
+
+```bash
+pip install "x-anylabeling-cvhub[cpu] @ git+https://github.com/Kababey/X-AnyLabeling.git@feature/dataset-management-tools"
+xanylabeling
+```
+
+Swap `[cpu]` for `[gpu]` (CUDA 12.x) or `[gpu-cu11]` (CUDA 11.x) if you have an NVIDIA GPU.
+
+Prefer a pre-built wheel or a standalone `.exe` / `.dmg` / `.AppImage`? Grab one from the [Releases page](https://github.com/Kababey/X-AnyLabeling/releases). Full walkthrough (all three install tiers, CLI usage, config paths): [**docs/en/get_started.md**](./docs/en/get_started.md).
+
 ## X-AnyLabeling
 
 **X-AnyLabeling** is a powerful annotation tool that integrates an AI engine for fast and automatic labeling. It's designed for multi-modal data engineers, offering industrial-grade solutions for complex tasks.

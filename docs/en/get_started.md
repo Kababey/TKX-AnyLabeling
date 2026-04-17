@@ -1,6 +1,110 @@
 # Quick Start Guide
 
-## 1. Installation and Deployment
+## Quick Install (Fork Edition)
+
+> **Placeholder notice:** This guide uses `https://github.com/Kababey/X-AnyLabeling` as a placeholder URL for the fork. **Replace it with your actual GitHub repository URL** before publishing or sharing this documentation.
+
+This fork adds features on top of upstream X-AnyLabeling: multi-project management, dataset import/export (YOLO, COCO, VOC, DOTA) with auto-detection, annotation version control, train/test/val split management, image resolution consistency, a class manager, a dataset health dashboard, and SAM2 Smart Select.
+
+You can install and run this fork **without cloning the source code**. Choose the tier that matches your environment:
+
+### Tier 1 — pip install from GitHub (for Python developers)
+
+Requires Python **3.11 or newer** and `pip`. Install directly from the fork's Git branch:
+
+```bash
+pip install "x-anylabeling-cvhub[cpu] @ git+https://github.com/Kababey/X-AnyLabeling.git@feature/dataset-management-tools"
+xanylabeling
+```
+
+Swap `[cpu]` for `[gpu]` (CUDA 12.x) or `[gpu-cu11]` (CUDA 11.x) if you have an NVIDIA GPU:
+
+```bash
+# CUDA 12.x
+pip install "x-anylabeling-cvhub[gpu] @ git+https://github.com/Kababey/X-AnyLabeling.git@feature/dataset-management-tools"
+
+# CUDA 11.x
+pip install "x-anylabeling-cvhub[gpu-cu11] @ git+https://github.com/Kababey/X-AnyLabeling.git@feature/dataset-management-tools"
+```
+
+> **Tip:** Use a fresh virtual environment (`python -m venv .venv` then activate it) to avoid dependency conflicts with other projects.
+
+### Tier 2 — Pre-built wheel from GitHub Releases (recommended for most users)
+
+Once the maintainer tags a release, a pre-built wheel is attached to the [Releases page](https://github.com/Kababey/X-AnyLabeling/releases). Download the `.whl` and install it with pip — no compiler, no Git, no source checkout required.
+
+```bash
+# After downloading x_anylabeling_cvhub-<version>-py3-none-any.whl from the Releases page:
+pip install "x_anylabeling_cvhub-4.0.0-py3-none-any.whl[cpu]"
+xanylabeling
+```
+
+Replace `[cpu]` with `[gpu]` or `[gpu-cu11]` as needed. This is the fastest path for users who already have Python installed but do not want to build from source.
+
+### Tier 3 — Standalone executable (for non-developers)
+
+No Python installation needed. Download the pre-packaged binary for your OS from the [Releases page](https://github.com/Kababey/X-AnyLabeling/releases) and double-click to run:
+
+| Platform | File |
+|----------|------|
+| Windows | `X-AnyLabeling-<version>-win.exe` |
+| macOS | `X-AnyLabeling-<version>.dmg` |
+| Linux | `X-AnyLabeling-<version>.AppImage` |
+
+> **Note:** Standalone builds may lag slightly behind the latest source. For the newest features, use Tier 1 or Tier 2.
+
+---
+
+## Running the App
+
+Once installed via Tier 1 or Tier 2, the following commands are available on your `PATH`.
+
+### Launch the GUI
+
+```bash
+xanylabeling
+```
+
+### CLI conversion between annotation formats
+
+```bash
+xanylabeling convert                # list all supported conversion tasks
+xanylabeling convert <task>         # show help and examples for a specific task
+xanylabeling convert xlabel2yolo    # example: convert XLABEL annotations to YOLO format
+```
+
+### Other useful commands
+
+```bash
+xanylabeling checks                 # show system and version information
+xanylabeling version                # print the installed version
+xanylabeling config                 # print the config file path
+xanylabeling --help                 # list all CLI options
+```
+
+### Config and data locations
+
+X-AnyLabeling stores settings and cached data in your home directory:
+
+| Path | Purpose |
+|------|---------|
+| `~/.xanylabelingrc` | User configuration file (UI preferences, default paths, etc.) |
+| `~/.xanylabeling/` | Projects registry — metadata for the multi-project home screen |
+| `~/.xanylabeling_data/` | Downloaded model weights and inference caches |
+
+On Windows, `~` resolves to `%USERPROFILE%` (typically `C:\Users\<you>`).
+
+To reset your UI configuration, delete `~/.xanylabelingrc` or run:
+
+```bash
+xanylabeling --reset-config
+```
+
+---
+
+## 1. Installation and Deployment (Upstream / Alternative Methods)
+
+> The sections below are the **original upstream installation instructions** from the parent X-AnyLabeling project. They still work, but most fork users should prefer the Quick Install tiers above.
 
 X-AnyLabeling provides multiple installation methods. You can install the official package directly via `pip` to get the latest stable version, install from source by cloning the official GitHub repository, or use the convenient GUI installer package.
 
