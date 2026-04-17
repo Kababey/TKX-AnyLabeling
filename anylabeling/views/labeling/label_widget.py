@@ -63,15 +63,21 @@ from .utils.file_search import (
     matches_filename,
     matches_label_attribute,
 )
+from .utils.project_manager import ProjectManager
+from .utils.split_manager import SplitManager
+from .utils.version_control import VersionManager
 from .widgets import (
     AboutDialog,
+    AddImagesDialog,
     AutoLabelingWidget,
     BrightnessContrastDialog,
     Canvas,
     ChatbotDialog,
     ClassifierDialog,
+    ClassManagerDialog,
     CompareViewManager,
     CompareViewSlider,
+    DatasetHealthDialog,
     VQADialog,
     CrosshairSettingsDialog,
     FileDialogPreview,
@@ -86,9 +92,12 @@ from .widgets import (
     GroupIDModifyDialog,
     OverviewDialog,
     Popup,
+    ProjectManagerDialog,
     SearchBar,
+    SplitManagerDialog,
     ToolBar,
     UniqueLabelQListWidget,
+    VersionControlDialog,
     ZoomWidget,
     NavigatorDialog,
 )
@@ -136,6 +145,10 @@ class LabelingWidget(LabelDialog):
         self.fn_to_index = {}
         self.cache_auto_label = None
         self.cache_auto_label_group_id = None
+        self.split_manager = None
+        self.version_manager = None
+        self.project_manager = ProjectManager()
+        self.current_project = None  # ProjectInfo if a project is active
 
         # see configs/anylabeling_config.yaml for valid configuration
         if config is None:
@@ -1537,6 +1550,71 @@ class LabelingWidget(LabelDialog):
             tip=self.tr("Export Custom VLM-R1 OVD Annotations"),
         )
 
+        # Dataset management actions
+        import_dataset = action(
+            self.tr("Import Dataset"),
+            lambda: utils.import_dataset_dialog(self),
+            None,
+            "folder",
+            self.tr("Import a structured dataset folder or ZIP archive"),
+        )
+        export_dataset = action(
+            self.tr("Export Dataset"),
+            lambda: utils.export_dataset_dialog(self),
+            None,
+            "folder",
+            self.tr("Export dataset with format and split structure"),
+        )
+        split_management = action(
+            self.tr("Split Management"),
+            self.open_split_management,
+            shortcuts.get("split_management"),
+            None,
+            self.tr("Manage train/test/val dataset splits"),
+        )
+        version_control = action(
+            self.tr("Version Control"),
+            self.open_version_control,
+            shortcuts.get("version_control"),
+            None,
+            self.tr("Manage annotation version snapshots"),
+        )
+        add_images_action = action(
+            self.tr("Add Images..."),
+            self.open_add_images_dialog,
+            None,
+            "folder",
+            self.tr("Add single images or a folder of images to the dataset"),
+        )
+        class_manager_action = action(
+            self.tr("Class Manager"),
+            self.open_class_manager,
+            None,
+            None,
+            self.tr("Rename, merge, or delete classes across all annotations"),
+        )
+        dataset_health_action = action(
+            self.tr("Dataset Health"),
+            self.open_dataset_health,
+            None,
+            None,
+            self.tr("View dataset statistics: class distribution, resolution, etc."),
+        )
+        project_manager_action = action(
+            self.tr("Project Manager..."),
+            self.open_project_manager,
+            None,
+            "folder",
+            self.tr("Manage multiple datasets as projects"),
+        )
+        close_project_action = action(
+            self.tr("Close Project"),
+            self.close_current_project,
+            None,
+            None,
+            self.tr("Close the current project (does not delete files)"),
+        )
+
         # Group zoom controls into a list for easier toggling.
         zoom_actions = (
             self.zoom_widget,
@@ -1696,6 +1774,15 @@ class LabelingWidget(LabelDialog):
             export_pporc_rec_annotation=export_pporc_rec_annotation,
             export_pporc_kie_annotation=export_pporc_kie_annotation,
             export_vlm_r1_ovd_annotation=export_vlm_r1_ovd_annotation,
+            import_dataset=import_dataset,
+            export_dataset=export_dataset,
+            split_management=split_management,
+            version_control=version_control,
+            add_images_action=add_images_action,
+            class_manager_action=class_manager_action,
+            dataset_health_action=dataset_health_action,
+            project_manager_action=project_manager_action,
+            close_project_action=close_project_action,
             zoom=zoom,
             zoom_in=zoom_in,
             zoom_out=zoom_out,
@@ -1887,6 +1974,14 @@ class LabelingWidget(LabelDialog):
                 delete_file,
                 delete_image_file,
                 None,
+                add_images_action,
+                None,
+                project_manager_action,
+                close_project_action,
+                None,
+                import_dataset,
+                export_dataset,
+                None,
             ),
         )
         utils.add_actions(self.menus.train, (ultralytics_train,))
@@ -1903,6 +1998,12 @@ class LabelingWidget(LabelDialog):
                 shape_manager,
                 None,
                 shape_converter,
+                None,
+                split_management,
+                version_control,
+                None,
+                class_manager_action,
+                dataset_health_action,
             ),
         )
         utils.add_actions(
@@ -2107,6 +2208,12 @@ class LabelingWidget(LabelDialog):
         )
         self.auto_labeling_widget.clear_auto_decode_requested.connect(
             self.canvas.reset_auto_decode_state
+        )
+        self.auto_labeling_widget.smart_select_mode_changed.connect(
+            self.canvas.set_smart_select_mode
+        )
+        self.auto_labeling_widget.undo_last_mark_requested.connect(
+            self.canvas.undo_last_auto_labeling_mark
         )
         self.canvas.auto_decode_requested.connect(
             self.on_auto_decode_requested
@@ -6056,6 +6163,305 @@ class LabelingWidget(LabelDialog):
         if image_files and self._config.get("exif_scan_enabled", True):
             self.async_exif_scanner.start_scan(image_files)
 
+        # Initialize split and version managers for the opened directory
+        try:
+            self.split_manager = SplitManager(
+                dirpath, self.output_dir
+            )
+            self.split_manager.sync_with_image_list(
+                [osp.basename(f) for f in self.image_list]
+            )
+            if self.split_manager.has_splits():
+                utils.update_file_list_split_indicators(
+                    self.file_list_widget, self.split_manager
+                )
+        except Exception as e:
+            logger.warning("Failed to initialize split manager: %s", e)
+            self.split_manager = None
+
+        try:
+            self.version_manager = VersionManager(
+                dirpath, self.output_dir
+            )
+        except Exception as e:
+            logger.warning("Failed to initialize version manager: %s", e)
+            self.version_manager = None
+
+    def open_split_management(self):
+        """Open the split management dialog."""
+        if not self.filename:
+            popup = Popup(
+                self.tr("Please load an image folder before proceeding!"),
+                self,
+            )
+            popup.show_popup(self, position="center")
+            return
+
+        if self.split_manager is None:
+            dirpath = osp.dirname(self.filename)
+            self.split_manager = SplitManager(
+                dirpath, self.output_dir
+            )
+            self.split_manager.sync_with_image_list(
+                [osp.basename(f) for f in self.image_list]
+            )
+
+        label_dir = self.output_dir or osp.dirname(self.filename)
+        dialog = SplitManagerDialog(
+            self.split_manager,
+            self.image_list,
+            label_dir,
+            parent=self,
+        )
+        if dialog.exec():
+            utils.update_file_list_split_indicators(
+                self.file_list_widget, self.split_manager
+            )
+
+    def open_version_control(self):
+        """Open the version control dialog."""
+        if not self.filename:
+            popup = Popup(
+                self.tr("Please load an image folder before proceeding!"),
+                self,
+            )
+            popup.show_popup(self, position="center")
+            return
+
+        if self.version_manager is None:
+            dirpath = osp.dirname(self.filename)
+            self.version_manager = VersionManager(
+                dirpath, self.output_dir
+            )
+
+        label_dir = self.output_dir or osp.dirname(self.filename)
+        dialog = VersionControlDialog(
+            self.version_manager,
+            self.image_list,
+            label_dir,
+            parent=self,
+        )
+        dialog.exec()
+
+    def _current_annotation_paths(self):
+        """Return list of existing annotation .json paths for loaded images."""
+        if not self.filename:
+            return []
+        label_dir = self.output_dir or osp.dirname(self.filename)
+        paths = []
+        for img in self.image_list:
+            base = osp.splitext(osp.basename(img))[0]
+            p = osp.join(label_dir, base + ".json")
+            if osp.isfile(p):
+                paths.append(p)
+            else:
+                alt = osp.join(osp.dirname(img), base + ".json")
+                if osp.isfile(alt):
+                    paths.append(alt)
+        return paths
+
+    def open_add_images_dialog(self):
+        """Open the Add Images dialog to add files/folders to the dataset."""
+        if not self.filename and not self.current_project:
+            popup = Popup(
+                self.tr("Please open a folder or project first!"),
+                self,
+            )
+            popup.show_popup(self, position="center")
+            return
+
+        if self.current_project:
+            target_dir = self.project_manager.get_images_dir(
+                self.current_project
+            )
+            os.makedirs(target_dir, exist_ok=True)
+            suggested_res = self.current_project.settings.get(
+                "target_resolution"
+            )
+            suggested = tuple(suggested_res) if suggested_res and suggested_res[0] > 0 else None
+        else:
+            target_dir = osp.dirname(self.filename)
+            suggested = None
+
+        # Suggest resolution from existing images if none set
+        if suggested is None and self.image_list:
+            from .utils.image_resizer import detect_target_resolution
+            try:
+                detected = detect_target_resolution(self.image_list[:20])
+                if detected != (0, 0):
+                    suggested = detected
+            except Exception as exc:
+                logger.debug("resolution detection failed: %s", exc)
+
+        dialog = AddImagesDialog(
+            target_dir=target_dir,
+            existing_images=self.image_list,
+            suggested_resolution=suggested,
+            parent=self,
+        )
+        if dialog.exec() == dialog.DialogCode.Accepted:
+            new_paths = dialog.result_paths()
+            if new_paths:
+                # Reload the folder to pick up new images
+                self.import_image_folder(target_dir)
+                popup = Popup(
+                    self.tr("Added %d images to dataset") % len(new_paths),
+                    self,
+                )
+                popup.show_popup(self, position="center")
+
+    def open_class_manager(self):
+        """Open the class manager dialog."""
+        if not self.filename:
+            popup = Popup(
+                self.tr("Please load a folder or project first!"),
+                self,
+            )
+            popup.show_popup(self, position="center")
+            return
+
+        classes = []
+        if self.current_project:
+            classes = list(self.current_project.classes)
+
+        ann_paths = self._current_annotation_paths()
+        dialog = ClassManagerDialog(
+            classes=classes,
+            annotation_paths=ann_paths,
+            parent=self,
+        )
+        dialog.classes_changed.connect(self._on_project_classes_changed)
+        dialog.exec()
+
+    def _on_project_classes_changed(self, classes):
+        """Persist class list to project file if a project is active."""
+        if self.current_project:
+            try:
+                self.project_manager.update_classes(
+                    self.current_project, classes
+                )
+            except Exception as exc:
+                logger.warning("Failed to persist classes: %s", exc)
+
+    def open_dataset_health(self):
+        """Open the dataset health dashboard."""
+        if not self.filename:
+            popup = Popup(
+                self.tr("Please load a folder or project first!"),
+                self,
+            )
+            popup.show_popup(self, position="center")
+            return
+
+        classes = []
+        if self.current_project:
+            classes = list(self.current_project.classes)
+
+        label_dir = self.output_dir or osp.dirname(self.filename)
+        dialog = DatasetHealthDialog(
+            image_list=self.image_list,
+            annotation_dir=label_dir,
+            classes=classes,
+            parent=self,
+        )
+        dialog.exec()
+
+    def open_project_manager(self):
+        """Open the project manager home screen."""
+        dialog = ProjectManagerDialog(self.project_manager, parent=self)
+        dialog.project_opened.connect(self._on_project_opened)
+        dialog.exec()
+
+    def _on_project_opened(self, project_path):
+        """Handle opening of a project from the project manager dialog."""
+        try:
+            info = self.project_manager.load_project(project_path)
+        except ValueError as exc:
+            popup = Popup(
+                self.tr("Cannot open project: %s") % exc,
+                self,
+            )
+            popup.show_popup(self, position="center")
+            return
+
+        self.current_project = info
+        images_dir = self.project_manager.get_images_dir(info)
+        os.makedirs(images_dir, exist_ok=True)
+        annotations_dir = self.project_manager.get_annotations_dir(info)
+        os.makedirs(annotations_dir, exist_ok=True)
+
+        # Route annotations to the project's annotations dir
+        self.output_dir = annotations_dir
+        self.import_image_folder(images_dir)
+
+        # Apply project classes to the label dialog if we have them
+        if info.classes:
+            try:
+                existing = set()
+                for c in info.classes:
+                    name = c.get("name") if isinstance(c, dict) else str(c)
+                    if name and name not in existing:
+                        self.label_dialog.add_label_history(name)
+                        existing.add(name)
+            except Exception as exc:
+                logger.debug("Could not seed label history: %s", exc)
+
+        self.setWindowTitle(f"X-AnyLabeling - {info.name}")
+        self._update_project_status_bar()
+
+    def close_current_project(self):
+        """Close the active project (does not delete any files)."""
+        if not self.current_project:
+            popup = Popup(
+                self.tr("No project is currently open."),
+                self,
+            )
+            popup.show_popup(self, position="center")
+            return
+        name = self.current_project.name
+        self.project_manager.close_project(self.current_project)
+        self.current_project = None
+        self.setWindowTitle("X-AnyLabeling")
+        self._update_project_status_bar()
+        popup = Popup(
+            self.tr("Closed project '%s'.\nFiles are unchanged.") % name,
+            self,
+        )
+        popup.show_popup(self, position="center")
+
+    def _update_project_status_bar(self):
+        """Show/update an indicator in the status bar for the current project."""
+        try:
+            sb = self.statusBar() if hasattr(self, "statusBar") else None
+        except Exception:
+            sb = None
+        if sb is None:
+            # Lazy-create a persistent project label on the first call
+            if not hasattr(self, "_project_status_label"):
+                return
+        if not hasattr(self, "_project_status_label"):
+            try:
+                self._project_status_label = QtWidgets.QLabel("")
+                self._project_status_label.setStyleSheet(
+                    "QLabel { padding: 2px 10px; color: #1565c0;"
+                    " font-weight: 600; }"
+                )
+                if sb:
+                    sb.addPermanentWidget(self._project_status_label)
+            except Exception as exc:
+                logger.debug("Could not create project status label: %s", exc)
+                return
+
+        if self.current_project:
+            img_count = self.current_project.stats.get("image_count", "?")
+            ann_count = self.current_project.stats.get("annotated_count", "?")
+            self._project_status_label.setText(
+                self.tr("Project: %s  |  %s images, %s annotated")
+                % (self.current_project.name, img_count, ann_count)
+            )
+        else:
+            self._project_status_label.setText("")
+
     def toggle_auto_labeling_widget(self):
         """Toggle auto labeling widget visibility."""
         if self.auto_labeling_widget.isVisible():
@@ -6107,6 +6513,15 @@ class LabelingWidget(LabelDialog):
             self.shape_text_edit.setDisabled(False)
 
         self.set_dirty()
+
+        # Smart Select mode: auto-prompt label assignment after SAM result
+        if self.canvas.smart_select_mode and not auto_labeling_result.replace:
+            has_object = any(
+                s.label == AutoLabelingMode.OBJECT
+                for s in self.canvas.shapes
+            )
+            if has_object:
+                self.finish_auto_labeling_object()
 
     def clear_auto_labeling_marks(self):
         """Clear auto labeling marks from the current image."""

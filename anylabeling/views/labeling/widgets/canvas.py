@@ -64,6 +64,7 @@ class Canvas(
     auto_labeling_marks_updated = QtCore.pyqtSignal(list)
     auto_decode_requested = QtCore.pyqtSignal(list)
     auto_decode_finish_requested = QtCore.pyqtSignal()
+    smart_select_mark_added = QtCore.pyqtSignal()
     shape_hover_changed = QtCore.pyqtSignal()
     split_position_changed = QtCore.pyqtSignal(float)
     edit_label_requested = QtCore.pyqtSignal()
@@ -223,6 +224,10 @@ class Canvas(
         self.auto_decode_timer.setSingleShot(True)
         self.auto_decode_tracklet = []
         self.last_mouse_pos = None
+
+        # Smart Select mode
+        self.smart_select_mode = False
+        self.preview_shapes = []  # Shapes to render as semi-transparent preview
 
         # Brush drawing mode for polygon
         self._brush_drawing = False
@@ -650,8 +655,10 @@ class Canvas(
             self.current.highlight_clear()
             return
 
-        # Polygon copy moving.
+        # Polygon copy moving (skip in Smart Select mode).
         if QtCore.Qt.MouseButton.RightButton & ev.buttons():
+            if self.smart_select_mode and self.is_auto_labeling:
+                return
             if self.selected_shapes_copy and self.prev_point:
                 self.override_cursor(CURSOR_MOVE)
                 self.bounded_move_shapes(self.selected_shapes_copy, pos)
@@ -1074,6 +1081,22 @@ class Canvas(
         pos = self.transform_pos(ev.position())
 
         if ev.button() == QtCore.Qt.MouseButton.LeftButton:
+            # Smart Select mode: left-click = positive point
+            if self.smart_select_mode and self.is_auto_labeling:
+                if not self.out_off_pixmap(pos):
+                    self.auto_labeling_mode = AutoLabelingMode(
+                        AutoLabelingMode.ADD, AutoLabelingMode.POINT
+                    )
+                    # Create a point shape as a positive mark
+                    mark_shape = Shape(shape_type="point")
+                    mark_shape.add_point(pos)
+                    mark_shape.label = AutoLabelingMode.ADD
+                    mark_shape.shape_type = AutoLabelingMode.POINT
+                    self.shapes.append(mark_shape)
+                    self.update()
+                    self.update_auto_labeling_marks()
+                    self.smart_select_mark_added.emit()
+                    return
             if self.drawing():
                 if self.current:
                     # Add point to existing shape.
@@ -1266,6 +1289,22 @@ class Canvas(
                 self.prev_pan_point = ev.position()
                 self.repaint()
         elif (
+            ev.button() == QtCore.Qt.MouseButton.RightButton
+            and self.smart_select_mode
+            and self.is_auto_labeling
+        ):
+            # Smart Select mode: right-click = negative point
+            if not self.out_off_pixmap(pos):
+                mark_shape = Shape(shape_type="point")
+                mark_shape.add_point(pos)
+                mark_shape.label = AutoLabelingMode.REMOVE
+                mark_shape.shape_type = AutoLabelingMode.POINT
+                self.shapes.append(mark_shape)
+                self.update()
+                self.update_auto_labeling_marks()
+                self.smart_select_mark_added.emit()
+                return
+        elif (
             ev.button() == QtCore.Qt.MouseButton.RightButton and self.editing()
         ):
             group_mode = (
@@ -1288,6 +1327,10 @@ class Canvas(
             return
 
         if ev.button() == QtCore.Qt.MouseButton.RightButton:
+            # In Smart Select mode, right-click is used for negative points
+            # so suppress the context menu.
+            if self.smart_select_mode and self.is_auto_labeling:
+                return
             menu = self.menus[len(self.selected_shapes_copy) > 0]
             self.restore_cursor()
             if (
@@ -2492,6 +2535,12 @@ class Canvas(
                     p.drawPath(cp)
                     p.fillPath(cp, QtGui.QColor(255, 153, 0, 255))
 
+        # Draw preview shapes (Smart Select overlay)
+        if self.preview_shapes:
+            for shape in self.preview_shapes:
+                shape.fill = True
+                shape.paint(p)
+
         if self.current:
             self.current.paint(p)
             self.line.paint(p)
@@ -3026,6 +3075,47 @@ class Canvas(
         self.update()
         if self.is_auto_labeling:
             self.update_auto_labeling_marks()
+
+    def set_smart_select_mode(self, enabled):
+        """Enable or disable smart select mode."""
+        self.smart_select_mode = enabled
+        if enabled:
+            # Enter auto-labeling point mode
+            self.is_auto_labeling = True
+            self.auto_labeling_mode = AutoLabelingMode(
+                AutoLabelingMode.ADD, AutoLabelingMode.POINT
+            )
+            # Switch to create mode (point drawing)
+            self.parent.toggle_draw_mode(
+                False, "point", disable_auto_labeling=False
+            )
+        else:
+            self.preview_shapes = []
+            self.update()
+
+    def set_preview_shapes(self, shapes):
+        """Set shapes to display as semi-transparent preview overlay."""
+        self.preview_shapes = shapes if shapes else []
+        self.update()
+
+    def clear_preview_shapes(self):
+        """Clear the preview overlay."""
+        self.preview_shapes = []
+        self.update()
+
+    def undo_last_auto_labeling_mark(self):
+        """Remove the last auto-labeling mark and re-trigger prediction."""
+        # Find and remove the last auto-labeling mark shape
+        for i in range(len(self.shapes) - 1, -1, -1):
+            shape = self.shapes[i]
+            if shape.label in (AutoLabelingMode.ADD, AutoLabelingMode.REMOVE):
+                self.shapes.pop(i)
+                self.update()
+                # Re-trigger prediction with remaining marks
+                self.update_auto_labeling_marks()
+                self.smart_select_mark_added.emit()
+                return True
+        return False
 
     def update_auto_labeling_marks(self):
         """Update the auto labeling marks"""

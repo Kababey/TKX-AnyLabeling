@@ -87,11 +87,27 @@
 <video src="https://github.com/user-attachments/assets/4a676ebf-d2ae-4327-b078-8e63a5323793" width="100%" controls>
 </video>
 
+- `2026-04-16`: Added Dataset Import/Export, Annotation Version Control, Train/Test/Val Split Management, and Smart Select mode for SAM/SAM2.
 - `2026-04-01`: Added support for Japanese and Korean UI languages (`ja_JP`, `ko_KR`).
 - `2026-03-22`: Added support for built-in Settings in the GUI for directly adjusting common options.
 - `2026-03-10`: Added support for 3D Cuboid shape annotation from rectangle.
 - `2026-03-01`: Completed the PyQt5-to-PyQt6 upgrade refactor (Beta release), along with additional feature fixes and optimizations.
 - For more details, please refer to the [CHANGELOG](./CHANGELOG.md)
+
+## Quick Install
+
+> Placeholder: replace `Kababey` with your actual GitHub username/org before publishing.
+
+Install and run this fork without cloning the source. Requires Python 3.11+.
+
+```bash
+pip install "x-anylabeling-cvhub[cpu] @ git+https://github.com/Kababey/X-AnyLabeling.git@feature/dataset-management-tools"
+xanylabeling
+```
+
+Swap `[cpu]` for `[gpu]` (CUDA 12.x) or `[gpu-cu11]` (CUDA 11.x) if you have an NVIDIA GPU.
+
+Prefer a pre-built wheel or a standalone `.exe` / `.dmg` / `.AppImage`? Grab one from the [Releases page](https://github.com/Kababey/X-AnyLabeling/releases). Full walkthrough (all three install tiers, CLI usage, config paths): [**docs/en/get_started.md**](./docs/en/get_started.md).
 
 ## X-AnyLabeling
 
@@ -112,6 +128,10 @@ Also, we highly recommend trying out [X-AnyLabeling-Server](https://github.com/C
 - Allows custom models and secondary development.
 - Supports one-click inference for all images in the current task.
 - Supports import/export for formats like COCO, VOC, YOLO, DOTA, MOT, MASK, PPOCR, MMGD, VLM-R1.
+- Full dataset import/export with auto-format detection, split-aware directory structure, and ZIP support.
+- Annotation version control with named snapshots, history comparison, and one-click restore.
+- Train/test/val split management with auto-split (random or stratified), manual assignment, and visual indicators.
+- Smart Select mode for SAM/SAM2: left-click for positive points, right-click for negative points, no button switching needed.
 - Handles tasks like `classification`, `detection`, `segmentation`, `caption`, `rotation`, `tracking`, `estimation`, `ocr`, `vqa`, `grounding` and so on.
 - Supports diverse annotation styles: `polygons`, `rectangles`, `cuboids`, `rotated boxes`, `quadrilaterals`, `circles`, `lines`, `line strips`, `points`, and annotations for `text detection`, `recognition`, and `KIE`.
 
@@ -149,6 +169,7 @@ Also, we highly recommend trying out [X-AnyLabeling-Server](https://github.com/C
 5. [Chatbot](./docs/en/chatbot.md)
 6. [VQA](./docs/en/vqa.md)
 7. [Multi-class Image Classifier](./docs/en/image_classifier.md)
+8. [Dataset Management](./docs/en/dataset_management.md) (Import/Export, Version Control, Splits, Smart Select)
 
 <img src="https://github.com/user-attachments/assets/0d67311c-f441-44b6-9ee0-932f25f51b1c" width="100%" />
 

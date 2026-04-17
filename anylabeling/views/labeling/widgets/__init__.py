@@ -23,8 +23,14 @@ from .model_dropdown_widget import SearchBar
 from .navigator_widget import NavigatorDialog
 from .overview_dialog import OverviewDialog
 from .polygon_sides_dialog import PolygonSidesDialog
+from .class_manager_dialog import ClassManagerDialog
+from .dataset_health_dialog import DatasetHealthDialog
+from .image_manager_dialog import AddImagesDialog
 from .popup import Popup
+from .project_manager_dialog import ProjectManagerDialog, NewProjectDialog
+from .split_dialog import SplitManagerDialog
 from .toolbar import ToolBar
 from .unique_label_qlist_widget import UniqueLabelQListWidget
+from .version_control_dialog import VersionControlDialog
 from .vqa_dialog import VQADialog
 from .zoom_widget import ZoomWidget
