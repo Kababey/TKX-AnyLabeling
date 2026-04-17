@@ -3,6 +3,7 @@ import os
 import os.path as osp
 import pathlib
 import shutil
+import tempfile
 import time
 import yaml
 import zipfile
@@ -50,7 +51,8 @@ FORMAT_MAP = {
     "Mask": ("custom_to_mask", None),
 }
 
-# Formats that require a classes file (txt) or config file (yaml for pose).
+# Formats that accept (but no longer require) a classes file.
+# When no file is provided the classes are auto-detected from annotations.
 FORMATS_NEEDING_CLASSES = {
     "YOLO (HBB)",
     "YOLO (OBB)",
@@ -82,6 +84,40 @@ def _is_coco_format(fmt_name):
 
 def _is_voc_format(fmt_name):
     return fmt_name.startswith("VOC")
+
+
+def _auto_detect_classes(image_list, label_dir):
+    """Scan XLABEL annotation JSON files and collect all unique class labels.
+
+    Args:
+        image_list: List of absolute image file paths.
+        label_dir: Directory where annotation JSONs are stored (the app's
+                   ``output_dir``).  Falls back to each image's own
+                   directory when a JSON is not found in *label_dir*.
+
+    Returns:
+        A sorted list of unique class-name strings.
+    """
+    classes = set()
+    for image_file in image_list:
+        base = os.path.splitext(os.path.basename(image_file))[0]
+        json_path = os.path.join(label_dir, base + ".json")
+        if not os.path.isfile(json_path):
+            # Fallback: same directory as the image.
+            json_path = os.path.join(
+                os.path.dirname(image_file), base + ".json"
+            )
+        if os.path.isfile(json_path):
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                for shape in data.get("shapes", []):
+                    label = shape.get("label", "")
+                    if label:
+                        classes.add(label)
+            except Exception:
+                pass
+    return sorted(classes)
 
 
 # ---------------------------------------------------------------------------
@@ -704,15 +740,15 @@ def export_dataset_dialog(self):
         format_combo.addItem(fmt_name)
     layout.addWidget(format_combo)
 
-    # -- 2. Classes / config file --
+    # -- 2. Classes / config file (optional for most formats) --
     classes_group = QGroupBox(self.tr("Classes / Config file"))
     classes_layout = QVBoxLayout()
     classes_layout.setSpacing(8)
 
     classes_hint = QtWidgets.QLabel(
         self.tr(
-            "Required for YOLO, COCO and DOTA formats.\n"
-            "Use a .txt file (one class per line) or .yaml for Pose formats.\n"
+            "Classes are auto-detected from annotations when no file is "
+            "selected.\nA .yaml config file is required for Pose formats.\n"
             "For Mask format, select a JSON color-map file."
         )
     )
@@ -725,7 +761,10 @@ def export_dataset_dialog(self):
 
     classes_edit = QtWidgets.QLineEdit()
     classes_edit.setPlaceholderText(
-        self.tr("Select classes.txt, pose config .yaml, or color-map .json")
+        self.tr(
+            "Optional - auto-detect from annotations "
+            "(or select classes.txt / .yaml / .json)"
+        )
     )
 
     def browse_classes_file():
@@ -896,21 +935,16 @@ def export_dataset_dialog(self):
     color_map = None
     converter = None
 
-    if format_name in FORMATS_NEEDING_CLASSES:
-        if not classes_path:
-            popup = Popup(
-                self.tr(
-                    "A classes file is required for %s format.\n"
-                    "Please select a .txt or .yaml file."
-                )
-                % format_name,
-                self,
-                icon=new_icon_path("warning", "svg"),
-            )
-            popup.show_popup(self, popup_height=65, position="center")
-            return
+    # ---- image list (needed early for auto-detection) ----
+    image_list = self.image_list if self.image_list else [self.filename]
 
-        if not osp.isfile(classes_path):
+    # ---- label directory (needed early for auto-detection) ----
+    label_dir_path = osp.dirname(self.filename)
+    if self.output_dir:
+        label_dir_path = self.output_dir
+
+    if format_name in FORMATS_NEEDING_CLASSES:
+        if classes_path and not osp.isfile(classes_path):
             popup = Popup(
                 self.tr("Classes file not found:\n%s") % classes_path,
                 self,
@@ -920,6 +954,19 @@ def export_dataset_dialog(self):
             return
 
         if format_name in FORMATS_NEEDING_YAML:
+            # Pose formats always require a YAML config file.
+            if not classes_path:
+                popup = Popup(
+                    self.tr(
+                        "A YAML config file is required for %s format.\n"
+                        "Please select a .yaml file."
+                    )
+                    % format_name,
+                    self,
+                    icon=new_icon_path("warning", "svg"),
+                )
+                popup.show_popup(self, popup_height=65, position="center")
+                return
             try:
                 converter = LabelConverter(pose_cfg_file=classes_path)
             except Exception as e:
@@ -933,8 +980,44 @@ def export_dataset_dialog(self):
                 )
                 popup.show_popup(self, popup_height=65, position="center")
                 return
-        else:
+        elif classes_path:
+            # User provided a classes file explicitly -- use it.
             converter = LabelConverter(classes_file=classes_path)
+        else:
+            # Auto-detect classes from annotation JSON files.
+            detected = _auto_detect_classes(image_list, label_dir_path)
+            if not detected:
+                popup = Popup(
+                    self.tr(
+                        "No classes could be auto-detected from the "
+                        "annotations.\nPlease select a classes file "
+                        "manually."
+                    ),
+                    self,
+                    icon=new_icon_path("warning", "svg"),
+                )
+                popup.show_popup(self, popup_height=65, position="center")
+                return
+
+            logger.info(
+                "Auto-detected %d classes: %s", len(detected), detected
+            )
+
+            # Write a temporary classes.txt so LabelConverter can load it.
+            tmp_classes_fd, tmp_classes_path = tempfile.mkstemp(
+                suffix=".txt", prefix="xlabel_classes_"
+            )
+            try:
+                with os.fdopen(tmp_classes_fd, "w", encoding="utf-8") as f:
+                    for cls in detected:
+                        f.write(f"{cls}\n")
+                converter = LabelConverter(classes_file=tmp_classes_path)
+            finally:
+                # Clean up the temp file after the converter has loaded it.
+                try:
+                    os.remove(tmp_classes_path)
+                except OSError:
+                    pass
     elif format_name == FORMAT_MASK:
         if not classes_path:
             popup = Popup(
@@ -1022,14 +1105,6 @@ def export_dataset_dialog(self):
         for split_name, filenames in all_splits.items():
             for fname in filenames:
                 partitions[fname] = split_name
-
-    # ---- image list ----
-    image_list = self.image_list if self.image_list else [self.filename]
-
-    # ---- label directory ----
-    label_dir_path = osp.dirname(self.filename)
-    if self.output_dir:
-        label_dir_path = self.output_dir
 
     # ---- progress dialog ----
     total = len(image_list)

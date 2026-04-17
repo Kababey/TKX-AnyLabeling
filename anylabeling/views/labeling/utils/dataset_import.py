@@ -226,6 +226,14 @@ class ImportThread(QThread):
         classes_file = self.classes_file or ds.classes_file
         pose_cfg_file = self.pose_cfg_file
 
+        # Guard: LabelConverter expects a plain-text file (one class per
+        # line).  If the detected classes_file is actually a YAML
+        # (e.g. data.yaml), ignore it so we fall through to ds.classes.
+        if classes_file and classes_file.lower().endswith(
+            (".yaml", ".yml")
+        ):
+            classes_file = None
+
         if fmt in _FORMATS_NEEDING_POSE_CFG:
             if pose_cfg_file:
                 return LabelConverter(pose_cfg_file=pose_cfg_file)

@@ -6240,6 +6240,15 @@ class LabelingWidget(LabelDialog):
 
         self.set_dirty()
 
+        # Smart Select mode: auto-prompt label assignment after SAM result
+        if self.canvas.smart_select_mode and not auto_labeling_result.replace:
+            has_object = any(
+                s.label == AutoLabelingMode.OBJECT
+                for s in self.canvas.shapes
+            )
+            if has_object:
+                self.finish_auto_labeling_object()
+
     def clear_auto_labeling_marks(self):
         """Clear auto labeling marks from the current image."""
         # Clean up label list

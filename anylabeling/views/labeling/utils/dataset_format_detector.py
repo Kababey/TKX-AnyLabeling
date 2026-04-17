@@ -293,7 +293,12 @@ def _try_detect_yolo(path: str) -> Optional[DatasetStructure]:
         names = [names[k] for k in sorted(names.keys())]
     if isinstance(names, list):
         result.classes = [str(n) for n in names]
-    result.classes_file = yaml_path
+    # Look for a plain-text classes file (classes.txt, etc.).
+    # Do NOT set classes_file to the YAML path -- LabelConverter
+    # expects a one-class-per-line text file, not a YAML document.
+    txt_classes_file = _find_classes_file(path)
+    if txt_classes_file:
+        result.classes_file = txt_classes_file
 
     # --- splits from yaml ------------------------------------------
     yaml_dir = osp.dirname(yaml_path)
