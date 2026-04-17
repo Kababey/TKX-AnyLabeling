@@ -63,17 +63,21 @@ from .utils.file_search import (
     matches_filename,
     matches_label_attribute,
 )
+from .utils.project_manager import ProjectManager
 from .utils.split_manager import SplitManager
 from .utils.version_control import VersionManager
 from .widgets import (
     AboutDialog,
+    AddImagesDialog,
     AutoLabelingWidget,
     BrightnessContrastDialog,
     Canvas,
     ChatbotDialog,
     ClassifierDialog,
+    ClassManagerDialog,
     CompareViewManager,
     CompareViewSlider,
+    DatasetHealthDialog,
     VQADialog,
     CrosshairSettingsDialog,
     FileDialogPreview,
@@ -88,6 +92,7 @@ from .widgets import (
     GroupIDModifyDialog,
     OverviewDialog,
     Popup,
+    ProjectManagerDialog,
     SearchBar,
     SplitManagerDialog,
     ToolBar,
@@ -142,6 +147,8 @@ class LabelingWidget(LabelDialog):
         self.cache_auto_label_group_id = None
         self.split_manager = None
         self.version_manager = None
+        self.project_manager = ProjectManager()
+        self.current_project = None  # ProjectInfo if a project is active
 
         # see configs/anylabeling_config.yaml for valid configuration
         if config is None:
@@ -1572,6 +1579,34 @@ class LabelingWidget(LabelDialog):
             None,
             self.tr("Manage annotation version snapshots"),
         )
+        add_images_action = action(
+            self.tr("Add Images..."),
+            self.open_add_images_dialog,
+            None,
+            "folder",
+            self.tr("Add single images or a folder of images to the dataset"),
+        )
+        class_manager_action = action(
+            self.tr("Class Manager"),
+            self.open_class_manager,
+            None,
+            None,
+            self.tr("Rename, merge, or delete classes across all annotations"),
+        )
+        dataset_health_action = action(
+            self.tr("Dataset Health"),
+            self.open_dataset_health,
+            None,
+            None,
+            self.tr("View dataset statistics: class distribution, resolution, etc."),
+        )
+        project_manager_action = action(
+            self.tr("Project Manager..."),
+            self.open_project_manager,
+            None,
+            "folder",
+            self.tr("Manage multiple datasets as projects"),
+        )
 
         # Group zoom controls into a list for easier toggling.
         zoom_actions = (
@@ -1736,6 +1771,10 @@ class LabelingWidget(LabelDialog):
             export_dataset=export_dataset,
             split_management=split_management,
             version_control=version_control,
+            add_images_action=add_images_action,
+            class_manager_action=class_manager_action,
+            dataset_health_action=dataset_health_action,
+            project_manager_action=project_manager_action,
             zoom=zoom,
             zoom_in=zoom_in,
             zoom_out=zoom_out,
@@ -1927,6 +1966,10 @@ class LabelingWidget(LabelDialog):
                 delete_file,
                 delete_image_file,
                 None,
+                add_images_action,
+                None,
+                project_manager_action,
+                None,
                 import_dataset,
                 export_dataset,
                 None,
@@ -1949,6 +1992,9 @@ class LabelingWidget(LabelDialog):
                 None,
                 split_management,
                 version_control,
+                None,
+                class_manager_action,
+                dataset_health_action,
             ),
         )
         utils.add_actions(
@@ -6187,6 +6233,171 @@ class LabelingWidget(LabelDialog):
             parent=self,
         )
         dialog.exec()
+
+    def _current_annotation_paths(self):
+        """Return list of existing annotation .json paths for loaded images."""
+        if not self.filename:
+            return []
+        label_dir = self.output_dir or osp.dirname(self.filename)
+        paths = []
+        for img in self.image_list:
+            base = osp.splitext(osp.basename(img))[0]
+            p = osp.join(label_dir, base + ".json")
+            if osp.isfile(p):
+                paths.append(p)
+            else:
+                alt = osp.join(osp.dirname(img), base + ".json")
+                if osp.isfile(alt):
+                    paths.append(alt)
+        return paths
+
+    def open_add_images_dialog(self):
+        """Open the Add Images dialog to add files/folders to the dataset."""
+        if not self.filename and not self.current_project:
+            popup = Popup(
+                self.tr("Please open a folder or project first!"),
+                self,
+            )
+            popup.show_popup(self, position="center")
+            return
+
+        if self.current_project:
+            target_dir = self.project_manager.get_images_dir(
+                self.current_project
+            )
+            os.makedirs(target_dir, exist_ok=True)
+            suggested_res = self.current_project.settings.get(
+                "target_resolution"
+            )
+            suggested = tuple(suggested_res) if suggested_res and suggested_res[0] > 0 else None
+        else:
+            target_dir = osp.dirname(self.filename)
+            suggested = None
+
+        # Suggest resolution from existing images if none set
+        if suggested is None and self.image_list:
+            from .utils.image_resizer import detect_target_resolution
+            try:
+                detected = detect_target_resolution(self.image_list[:20])
+                if detected != (0, 0):
+                    suggested = detected
+            except Exception as exc:
+                logger.debug("resolution detection failed: %s", exc)
+
+        dialog = AddImagesDialog(
+            target_dir=target_dir,
+            existing_images=self.image_list,
+            suggested_resolution=suggested,
+            parent=self,
+        )
+        if dialog.exec() == dialog.DialogCode.Accepted:
+            new_paths = dialog.result_paths()
+            if new_paths:
+                # Reload the folder to pick up new images
+                self.import_image_folder(target_dir)
+                popup = Popup(
+                    self.tr("Added %d images to dataset") % len(new_paths),
+                    self,
+                )
+                popup.show_popup(self, position="center")
+
+    def open_class_manager(self):
+        """Open the class manager dialog."""
+        if not self.filename:
+            popup = Popup(
+                self.tr("Please load a folder or project first!"),
+                self,
+            )
+            popup.show_popup(self, position="center")
+            return
+
+        classes = []
+        if self.current_project:
+            classes = list(self.current_project.classes)
+
+        ann_paths = self._current_annotation_paths()
+        dialog = ClassManagerDialog(
+            classes=classes,
+            annotation_paths=ann_paths,
+            parent=self,
+        )
+        dialog.classes_changed.connect(self._on_project_classes_changed)
+        dialog.exec()
+
+    def _on_project_classes_changed(self, classes):
+        """Persist class list to project file if a project is active."""
+        if self.current_project:
+            try:
+                self.project_manager.update_classes(
+                    self.current_project, classes
+                )
+            except Exception as exc:
+                logger.warning("Failed to persist classes: %s", exc)
+
+    def open_dataset_health(self):
+        """Open the dataset health dashboard."""
+        if not self.filename:
+            popup = Popup(
+                self.tr("Please load a folder or project first!"),
+                self,
+            )
+            popup.show_popup(self, position="center")
+            return
+
+        classes = []
+        if self.current_project:
+            classes = list(self.current_project.classes)
+
+        label_dir = self.output_dir or osp.dirname(self.filename)
+        dialog = DatasetHealthDialog(
+            image_list=self.image_list,
+            annotation_dir=label_dir,
+            classes=classes,
+            parent=self,
+        )
+        dialog.exec()
+
+    def open_project_manager(self):
+        """Open the project manager home screen."""
+        dialog = ProjectManagerDialog(self.project_manager, parent=self)
+        dialog.project_opened.connect(self._on_project_opened)
+        dialog.exec()
+
+    def _on_project_opened(self, project_path):
+        """Handle opening of a project from the project manager dialog."""
+        try:
+            info = self.project_manager.load_project(project_path)
+        except ValueError as exc:
+            popup = Popup(
+                self.tr("Cannot open project: %s") % exc,
+                self,
+            )
+            popup.show_popup(self, position="center")
+            return
+
+        self.current_project = info
+        images_dir = self.project_manager.get_images_dir(info)
+        os.makedirs(images_dir, exist_ok=True)
+        annotations_dir = self.project_manager.get_annotations_dir(info)
+        os.makedirs(annotations_dir, exist_ok=True)
+
+        # Route annotations to the project's annotations dir
+        self.output_dir = annotations_dir
+        self.import_image_folder(images_dir)
+
+        # Apply project classes to the label dialog if we have them
+        if info.classes:
+            try:
+                existing = set()
+                for c in info.classes:
+                    name = c.get("name") if isinstance(c, dict) else str(c)
+                    if name and name not in existing:
+                        self.label_dialog.add_label_history(name)
+                        existing.add(name)
+            except Exception as exc:
+                logger.debug("Could not seed label history: %s", exc)
+
+        self.setWindowTitle(f"X-AnyLabeling - {info.name}")
 
     def toggle_auto_labeling_widget(self):
         """Toggle auto labeling widget visibility."""
