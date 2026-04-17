@@ -115,7 +115,10 @@ celerybeat.pid
 .env
 .venv
 .idea
-.github
+# Exclude IDE-specific .github contents but track workflows
+.github/*
+!.github/workflows/
+!.github/workflows/**
 env/
 venv/
 ENV/
