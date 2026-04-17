@@ -123,6 +123,9 @@ class ImportThread(QThread):
         classes_file=None,
         pose_cfg_file=None,
         format_override=None,
+        project_images_dir=None,
+        target_resolution=None,
+        resize_mode="none",
     ):
         super().__init__()
         self.source_path = source_path
@@ -131,6 +134,10 @@ class ImportThread(QThread):
         self.classes_file = classes_file
         self.pose_cfg_file = pose_cfg_file
         self.format_override = format_override
+        # Project integration
+        self.project_images_dir = project_images_dir
+        self.target_resolution = target_resolution  # (w, h) or None
+        self.resize_mode = resize_mode  # "letterbox" | "center_crop" | "stretch" | "none"
         self._cancelled = False
 
     def cancel(self):
@@ -269,6 +276,89 @@ class ImportThread(QThread):
         else:
             return LabelConverter()
 
+    def _unique_dst_path(self, target_dir, filename):
+        """Return a path inside target_dir that does not collide with existing files."""
+        dst = osp.join(target_dir, filename)
+        if not osp.exists(dst):
+            return dst
+        base, ext = osp.splitext(filename)
+        i = 1
+        while True:
+            candidate = osp.join(target_dir, f"{base}_{i}{ext}")
+            if not osp.exists(candidate):
+                return candidate
+            i += 1
+
+    def _copy_image_to_project(self, src_image_path):
+        """Copy (and optionally resize) an image into the project images dir.
+
+        Returns a tuple (new_image_path, resize_result_or_none).
+        When no project_images_dir is set, returns (src_image_path, None).
+        """
+        if not self.project_images_dir:
+            return src_image_path, None
+
+        os.makedirs(self.project_images_dir, exist_ok=True)
+        dst = self._unique_dst_path(
+            self.project_images_dir, osp.basename(src_image_path)
+        )
+
+        # Decide whether to resize
+        should_resize = (
+            self.target_resolution
+            and self.target_resolution[0] > 0
+            and self.target_resolution[1] > 0
+            and self.resize_mode not in (None, "none", "")
+        )
+        if should_resize:
+            try:
+                from anylabeling.views.labeling.utils.image_resizer import (
+                    ResizeMode,
+                    resize_image,
+                )
+                mode = ResizeMode(self.resize_mode)
+                result = resize_image(
+                    src_image_path, dst, self.target_resolution, mode
+                )
+                if result.success:
+                    return dst, result
+                logger.warning(
+                    "Resize failed for %s: %s. Falling back to copy.",
+                    src_image_path, result.error,
+                )
+            except Exception as e:
+                logger.warning("Resize error for %s: %s", src_image_path, e)
+        try:
+            shutil.copy2(src_image_path, dst)
+        except OSError as e:
+            logger.warning("Copy failed for %s: %s", src_image_path, e)
+            return src_image_path, None
+        return dst, None
+
+    def _apply_resize_to_annotation(self, json_path, resize_result):
+        """If an annotation JSON exists at json_path, transform its
+        coordinates using the provided ResizeResult."""
+        if not resize_result or not resize_result.success:
+            return
+        if not osp.isfile(json_path):
+            return
+        try:
+            from anylabeling.views.labeling.utils.image_resizer import (
+                transform_annotation,
+            )
+            import json as _json
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = _json.load(f)
+            data = transform_annotation(data, resize_result)
+            # Also update imagePath to point at the new basename
+            data["imagePath"] = osp.basename(resize_result.output_path)
+            with open(json_path, "w", encoding="utf-8") as f:
+                _json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.warning(
+                "Failed to transform annotation %s: %s", json_path, e
+            )
+
     def _import_xlabel(self, ds, all_images, total_files):
         """Import XLABEL format -- copy existing JSON annotation files."""
         copied_images = []
@@ -276,14 +366,25 @@ class ImportThread(QThread):
             if self._cancelled:
                 break
 
-            json_name = osp.splitext(osp.basename(image_path))[0] + ".json"
-            # Look for the JSON next to the image
-            json_src = osp.join(osp.dirname(image_path), json_name)
-            if osp.exists(json_src):
-                json_dst = osp.join(self.output_dir, json_name)
-                shutil.copy2(json_src, json_dst)
+            # Copy image into project dir if configured
+            new_image_path, resize_result = self._copy_image_to_project(
+                image_path
+            )
 
-            copied_images.append(image_path)
+            # Use new filename when we copied so the JSON stem matches
+            stem = osp.splitext(osp.basename(new_image_path))[0]
+            json_name = stem + ".json"
+            json_src = osp.join(
+                osp.dirname(image_path),
+                osp.splitext(osp.basename(image_path))[0] + ".json",
+            )
+            json_dst = osp.join(self.output_dir, json_name)
+            if osp.exists(json_src):
+                shutil.copy2(json_src, json_dst)
+                if resize_result:
+                    self._apply_resize_to_annotation(json_dst, resize_result)
+
+            copied_images.append(new_image_path)
             pct = int((i + 1) / total_files * 100)
             self.progress.emit(i + 1, total_files, pct)
 
@@ -338,7 +439,46 @@ class ImportThread(QThread):
             pct = min(int(processed / total_files * 100), 100)
             self.progress.emit(processed, total_files, pct)
 
-        self.finished.emit(True, "", self.output_dir, all_images)
+        # Copy images into project dir (and transform annotations if resized)
+        final_images = []
+        if self.project_images_dir:
+            for image_path in all_images:
+                if self._cancelled:
+                    break
+                new_image_path, resize_result = self._copy_image_to_project(
+                    image_path
+                )
+                final_images.append(new_image_path)
+
+                # Find the generated annotation and fix imagePath / resize
+                stem = osp.splitext(osp.basename(image_path))[0]
+                json_out = osp.join(self.output_dir, stem + ".json")
+                if osp.isfile(json_out):
+                    if resize_result:
+                        self._apply_resize_to_annotation(
+                            json_out, resize_result
+                        )
+                    else:
+                        self._update_annotation_image_path(
+                            json_out, osp.basename(new_image_path)
+                        )
+                    # If the image was renamed to avoid collision,
+                    # rename the json to match
+                    new_stem = osp.splitext(
+                        osp.basename(new_image_path)
+                    )[0]
+                    if new_stem != stem:
+                        renamed = osp.join(
+                            self.output_dir, new_stem + ".json"
+                        )
+                        try:
+                            os.replace(json_out, renamed)
+                        except OSError:
+                            pass
+        else:
+            final_images = list(all_images)
+
+        self.finished.emit(True, "", self.output_dir, final_images)
 
     def _import_per_file(self, ds, fmt, converter, all_images, total_files):
         """Import per-file formats: YOLO, VOC, DOTA."""
@@ -348,34 +488,67 @@ class ImportThread(QThread):
             if self._cancelled:
                 break
 
-            image_basename = osp.basename(image_path)
-            image_stem = osp.splitext(image_basename)[0]
-            output_json = osp.join(self.output_dir, image_stem + ".json")
+            # Copy image into project (possibly resized) BEFORE conversion
+            # so LabelConverter sees the final image dimensions.
+            new_image_path, resize_result = self._copy_image_to_project(
+                image_path
+            )
 
-            # Determine annotation file path
+            final_basename = osp.basename(new_image_path)
+            final_stem = osp.splitext(final_basename)[0]
+            output_json = osp.join(self.output_dir, final_stem + ".json")
+
+            # Determine annotation file path (always look in source location)
             ann_file = self._find_annotation_file(ds, image_path, fmt)
 
             if ann_file and osp.exists(ann_file):
                 try:
+                    # Convert using the ORIGINAL image so dimensions match
+                    # the annotation's coordinate space. We'll transform
+                    # the resulting JSON if we resized.
                     self._convert_single_file(
                         converter, fmt, ann_file, output_json, image_path,
-                        image_basename,
+                        osp.basename(image_path),
                     )
-                    imported_images.append(image_path)
+                    if resize_result:
+                        self._apply_resize_to_annotation(
+                            output_json, resize_result
+                        )
+                    else:
+                        # Still make sure imagePath points to the new file
+                        self._update_annotation_image_path(
+                            output_json, final_basename
+                        )
+                    imported_images.append(new_image_path)
                 except Exception as e:
                     logger.warning(
                         "Failed to convert annotation for %s: %s",
-                        image_basename,
+                        final_basename,
                         str(e),
                     )
+                    imported_images.append(new_image_path)
             else:
-                # Image without annotation -- skip silently
-                imported_images.append(image_path)
+                # Image without annotation -- still include it
+                imported_images.append(new_image_path)
 
             pct = int((i + 1) / total_files * 100)
             self.progress.emit(i + 1, total_files, pct)
 
         self.finished.emit(True, "", self.output_dir, imported_images)
+
+    def _update_annotation_image_path(self, json_path, basename):
+        """Update imagePath in an annotation JSON to point to basename."""
+        if not osp.isfile(json_path):
+            return
+        try:
+            import json as _json
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = _json.load(f)
+            data["imagePath"] = basename
+            with open(json_path, "w", encoding="utf-8") as f:
+                _json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
 
     def _find_annotation_file(self, ds, image_path, fmt):
         """Locate the annotation file corresponding to an image."""
@@ -641,6 +814,24 @@ def import_dataset_dialog(self):
     main_layout.setContentsMargins(24, 24, 24, 24)
     main_layout.setSpacing(16)
 
+    # --- Project context banner ---
+    active_project = getattr(self, "current_project", None)
+    if active_project is not None:
+        banner = QtWidgets.QLabel(
+            self.tr(
+                "Project active: <b>%s</b><br/>"
+                "Images will be copied into the project and "
+                "annotations will be saved inside it."
+            ) % active_project.name
+        )
+        banner.setTextFormat(Qt.TextFormat.RichText)
+        banner.setWordWrap(True)
+        banner.setStyleSheet(
+            "QLabel { background: #e3f2fd; color: #0d47a1;"
+            " border-radius: 6px; padding: 10px; }"
+        )
+        main_layout.addWidget(banner)
+
     # --- Section 1: Source path (read-only) ---
     src_path_layout = QVBoxLayout()
     src_path_label = QtWidgets.QLabel(self.tr("Source path"))
@@ -802,42 +993,60 @@ def import_dataset_dialog(self):
 
     # --- Section 5: Output directory ---
     output_layout = QVBoxLayout()
-    output_label = QtWidgets.QLabel(
-        self.tr("Output directory for converted annotations")
-    )
-    output_layout.addWidget(output_label)
 
-    output_input_layout = QHBoxLayout()
-    output_input_layout.setSpacing(8)
-
-    output_edit = QtWidgets.QLineEdit()
-    # Default output directory: next to source path
-    if zipfile.is_zipfile(source_path):
-        default_output = osp.join(
-            osp.dirname(source_path), "xlabel_annotations"
+    if active_project is not None:
+        # Project-managed output: locked to project's annotations dir
+        project_ann_dir = getattr(self, "project_manager").get_annotations_dir(
+            active_project
         )
+        output_label = QtWidgets.QLabel(
+            self.tr("Annotations output (project-managed)")
+        )
+        output_layout.addWidget(output_label)
+
+        output_edit = QtWidgets.QLineEdit()
+        output_edit.setText(project_ann_dir)
+        output_edit.setReadOnly(True)
+        output_edit.setStyleSheet("background: #f5f5f5;")
+        output_layout.addWidget(output_edit)
     else:
-        default_output = osp.join(source_path, "xlabel_annotations")
-    output_edit.setText(osp.realpath(default_output))
-    output_edit.setPlaceholderText(self.tr("Select Output Directory"))
-
-    def browse_output_dir():
-        path = QtWidgets.QFileDialog.getExistingDirectory(
-            dialog,
-            self.tr("Select Output Directory"),
-            output_edit.text(),
-            QtWidgets.QFileDialog.Option.DontUseNativeDialog,
+        output_label = QtWidgets.QLabel(
+            self.tr("Output directory for converted annotations")
         )
-        if path:
-            output_edit.setText(path)
+        output_layout.addWidget(output_label)
 
-    output_browse_btn = QtWidgets.QPushButton(self.tr("Browse"))
-    output_browse_btn.clicked.connect(browse_output_dir)
-    output_browse_btn.setStyleSheet(get_cancel_btn_style())
+        output_input_layout = QHBoxLayout()
+        output_input_layout.setSpacing(8)
 
-    output_input_layout.addWidget(output_edit)
-    output_input_layout.addWidget(output_browse_btn)
-    output_layout.addLayout(output_input_layout)
+        output_edit = QtWidgets.QLineEdit()
+        # Default output directory: next to source path
+        if zipfile.is_zipfile(source_path):
+            default_output = osp.join(
+                osp.dirname(source_path), "xlabel_annotations"
+            )
+        else:
+            default_output = osp.join(source_path, "xlabel_annotations")
+        output_edit.setText(osp.realpath(default_output))
+        output_edit.setPlaceholderText(self.tr("Select Output Directory"))
+
+        def browse_output_dir():
+            path = QtWidgets.QFileDialog.getExistingDirectory(
+                dialog,
+                self.tr("Select Output Directory"),
+                output_edit.text(),
+                QtWidgets.QFileDialog.Option.DontUseNativeDialog,
+            )
+            if path:
+                output_edit.setText(path)
+
+        output_browse_btn = QtWidgets.QPushButton(self.tr("Browse"))
+        output_browse_btn.clicked.connect(browse_output_dir)
+        output_browse_btn.setStyleSheet(get_cancel_btn_style())
+
+        output_input_layout.addWidget(output_edit)
+        output_input_layout.addWidget(output_browse_btn)
+        output_layout.addLayout(output_input_layout)
+
     main_layout.addLayout(output_layout)
 
     # --- Buttons: Cancel / Import ---
@@ -960,6 +1169,28 @@ def import_dataset_dialog(self):
     if chosen_format != detected_fmt:
         format_override = chosen_format
 
+    # Project integration: copy images into project dir if active
+    project_images_dir = None
+    target_resolution = None
+    resize_mode = "none"
+    if active_project is not None:
+        project_images_dir = self.project_manager.get_images_dir(
+            active_project
+        )
+        os.makedirs(project_images_dir, exist_ok=True)
+        tr = active_project.settings.get("target_resolution") or [0, 0]
+        if (
+            isinstance(tr, (list, tuple))
+            and len(tr) == 2
+            and tr[0] > 0
+            and tr[1] > 0
+            and active_project.settings.get("auto_resize_new_images", False)
+        ):
+            target_resolution = (int(tr[0]), int(tr[1]))
+            resize_mode = active_project.settings.get(
+                "resize_mode", "letterbox"
+            )
+
     self.import_thread = ImportThread(
         source_path=source_path,
         dataset_structure=ds,
@@ -967,6 +1198,9 @@ def import_dataset_dialog(self):
         classes_file=user_classes_file,
         pose_cfg_file=user_pose_cfg,
         format_override=format_override,
+        project_images_dir=project_images_dir,
+        target_resolution=target_resolution,
+        resize_mode=resize_mode,
     )
 
     def on_progress(current, total, percentage):
@@ -993,14 +1227,41 @@ def import_dataset_dialog(self):
             popup.show_popup(self, popup_height=85, position="center")
 
             # ----------------------------------------------------------
-            # Step 5: Load the first split's image directory
+            # Step 5: Load images
             # ----------------------------------------------------------
             if image_list:
-                # Find the directory containing the images
-                first_image_dir = osp.dirname(image_list[0])
                 # Set the output_dir so annotations are loaded from there
                 self.output_dir = result_dir
-                self.import_image_folder(first_image_dir)
+                if active_project is not None:
+                    # Reload from the PROJECT images dir so we pick up
+                    # newly copied images AND any pre-existing ones.
+                    self.import_image_folder(
+                        self.project_manager.get_images_dir(active_project)
+                    )
+                    # Update project stats
+                    try:
+                        self.project_manager.update_stats(
+                            active_project,
+                            image_count=len(self.image_list),
+                            annotated_count=sum(
+                                1 for p in self.image_list
+                                if osp.isfile(
+                                    osp.join(
+                                        result_dir,
+                                        osp.splitext(osp.basename(p))[0] + ".json"
+                                    )
+                                )
+                            ),
+                            total_shapes=active_project.stats.get(
+                                "total_shapes", 0
+                            ),
+                        )
+                    except Exception as exc:
+                        logger.debug("Failed to update project stats: %s", exc)
+                else:
+                    # Legacy behavior: load from the source dataset dir
+                    first_image_dir = osp.dirname(image_list[0])
+                    self.import_image_folder(first_image_dir)
         else:
             message = self.tr(
                 "Error occurred while importing dataset:\n%s"

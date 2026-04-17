@@ -1607,6 +1607,13 @@ class LabelingWidget(LabelDialog):
             "folder",
             self.tr("Manage multiple datasets as projects"),
         )
+        close_project_action = action(
+            self.tr("Close Project"),
+            self.close_current_project,
+            None,
+            None,
+            self.tr("Close the current project (does not delete files)"),
+        )
 
         # Group zoom controls into a list for easier toggling.
         zoom_actions = (
@@ -1775,6 +1782,7 @@ class LabelingWidget(LabelDialog):
             class_manager_action=class_manager_action,
             dataset_health_action=dataset_health_action,
             project_manager_action=project_manager_action,
+            close_project_action=close_project_action,
             zoom=zoom,
             zoom_in=zoom_in,
             zoom_out=zoom_out,
@@ -1969,6 +1977,7 @@ class LabelingWidget(LabelDialog):
                 add_images_action,
                 None,
                 project_manager_action,
+                close_project_action,
                 None,
                 import_dataset,
                 export_dataset,
@@ -6398,6 +6407,60 @@ class LabelingWidget(LabelDialog):
                 logger.debug("Could not seed label history: %s", exc)
 
         self.setWindowTitle(f"X-AnyLabeling - {info.name}")
+        self._update_project_status_bar()
+
+    def close_current_project(self):
+        """Close the active project (does not delete any files)."""
+        if not self.current_project:
+            popup = Popup(
+                self.tr("No project is currently open."),
+                self,
+            )
+            popup.show_popup(self, position="center")
+            return
+        name = self.current_project.name
+        self.project_manager.close_project(self.current_project)
+        self.current_project = None
+        self.setWindowTitle("X-AnyLabeling")
+        self._update_project_status_bar()
+        popup = Popup(
+            self.tr("Closed project '%s'.\nFiles are unchanged.") % name,
+            self,
+        )
+        popup.show_popup(self, position="center")
+
+    def _update_project_status_bar(self):
+        """Show/update an indicator in the status bar for the current project."""
+        try:
+            sb = self.statusBar() if hasattr(self, "statusBar") else None
+        except Exception:
+            sb = None
+        if sb is None:
+            # Lazy-create a persistent project label on the first call
+            if not hasattr(self, "_project_status_label"):
+                return
+        if not hasattr(self, "_project_status_label"):
+            try:
+                self._project_status_label = QtWidgets.QLabel("")
+                self._project_status_label.setStyleSheet(
+                    "QLabel { padding: 2px 10px; color: #1565c0;"
+                    " font-weight: 600; }"
+                )
+                if sb:
+                    sb.addPermanentWidget(self._project_status_label)
+            except Exception as exc:
+                logger.debug("Could not create project status label: %s", exc)
+                return
+
+        if self.current_project:
+            img_count = self.current_project.stats.get("image_count", "?")
+            ann_count = self.current_project.stats.get("annotated_count", "?")
+            self._project_status_label.setText(
+                self.tr("Project: %s  |  %s images, %s annotated")
+                % (self.current_project.name, img_count, ann_count)
+            )
+        else:
+            self._project_status_label.setText("")
 
     def toggle_auto_labeling_widget(self):
         """Toggle auto labeling widget visibility."""
