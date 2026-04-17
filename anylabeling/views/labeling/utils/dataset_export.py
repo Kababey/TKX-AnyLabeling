@@ -1061,26 +1061,25 @@ def export_dataset_dialog(self):
         converter = LabelConverter()
 
     # ---- handle output directory ----
-    if osp.exists(output_dir):
+    if osp.exists(output_dir) and os.listdir(output_dir):
         msg_box = QtWidgets.QMessageBox(self)
         msg_box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
-        msg_box.setWindowTitle(self.tr("Output Directory Exists!"))
+        msg_box.setWindowTitle(self.tr("Output Directory Not Empty"))
         msg_box.setText(
-            self.tr("Directory already exists. Choose an action:")
+            self.tr(
+                "The selected directory is not empty.\n"
+                "Export files will be added alongside existing files."
+            )
         )
         msg_box.setInformativeText(
             self.tr(
-                "- Yes    - Merge with existing files\n"
-                "- No     - Delete existing directory\n"
-                "- Cancel - Abort export"
+                "Click OK to continue exporting into this directory,\n"
+                "or Cancel to choose a different location."
             )
         )
 
         msg_box.addButton(
-            self.tr("Yes"), QtWidgets.QMessageBox.ButtonRole.YesRole
-        )
-        no_button = msg_box.addButton(
-            self.tr("No"), QtWidgets.QMessageBox.ButtonRole.NoRole
+            self.tr("OK"), QtWidgets.QMessageBox.ButtonRole.AcceptRole
         )
         cancel_btn = msg_box.addButton(
             self.tr("Cancel"), QtWidgets.QMessageBox.ButtonRole.RejectRole
@@ -1088,14 +1087,10 @@ def export_dataset_dialog(self):
         msg_box.setStyleSheet(get_msg_box_style())
         msg_box.exec()
 
-        clicked = msg_box.clickedButton()
-        if clicked == no_button:
-            shutil.rmtree(output_dir)
-            os.makedirs(output_dir)
-        elif clicked == cancel_btn:
+        if msg_box.clickedButton() == cancel_btn:
             return
     else:
-        os.makedirs(output_dir)
+        os.makedirs(output_dir, exist_ok=True)
 
     # ---- build partitions dict ----
     partitions = None

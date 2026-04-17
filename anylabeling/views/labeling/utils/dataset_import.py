@@ -913,21 +913,18 @@ def import_dataset_dialog(self):
         msg_box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
         msg_box.setWindowTitle(self.tr("Output Directory Exists!"))
         msg_box.setText(
-            self.tr("Directory already exists and is not empty. "
-                     "Choose an action:")
+            self.tr("The output directory is not empty.\n"
+                     "Imported annotations will be added alongside "
+                     "existing files.")
         )
         msg_box.setInformativeText(
             self.tr(
-                "- Yes    - Merge with existing files\n"
-                "- No     - Delete existing directory\n"
-                "- Cancel - Abort import"
+                "Click OK to continue importing,\n"
+                "or Cancel to choose a different location."
             )
         )
         msg_box.addButton(
-            self.tr("Yes"), QtWidgets.QMessageBox.ButtonRole.YesRole
-        )
-        no_button = msg_box.addButton(
-            self.tr("No"), QtWidgets.QMessageBox.ButtonRole.NoRole
+            self.tr("OK"), QtWidgets.QMessageBox.ButtonRole.AcceptRole
         )
         cancel_msg_btn = msg_box.addButton(
             self.tr("Cancel"), QtWidgets.QMessageBox.ButtonRole.RejectRole
@@ -935,11 +932,7 @@ def import_dataset_dialog(self):
         msg_box.setStyleSheet(get_msg_box_style())
         msg_box.exec()
 
-        clicked = msg_box.clickedButton()
-        if clicked == no_button:
-            shutil.rmtree(output_dir)
-            os.makedirs(output_dir)
-        elif clicked == cancel_msg_btn:
+        if msg_box.clickedButton() == cancel_msg_btn:
             return
     else:
         os.makedirs(output_dir, exist_ok=True)
