@@ -4,6 +4,8 @@ from .async_exif import AsyncExifScanner, ExifProcessingDialog
 from .batch import run_all_images
 from .colormap import label_colormap
 from .crop import save_crop
+from .dataset_export import export_dataset_dialog
+from .dataset_import import import_dataset_dialog
 from .export import (
     export_yolo_annotation,
     export_voc_annotation,
@@ -71,5 +73,9 @@ from .upload import (
     upload_mmgd_annotation,
     upload_ppocr_annotation,
     upload_vlm_r1_ovd_annotation,
+)
+from .split_indicators import (
+    update_file_list_split_indicators,
+    clear_split_indicators,
 )
 from .video import open_video_file

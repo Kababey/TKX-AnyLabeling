@@ -63,6 +63,8 @@ from .utils.file_search import (
     matches_filename,
     matches_label_attribute,
 )
+from .utils.split_manager import SplitManager
+from .utils.version_control import VersionManager
 from .widgets import (
     AboutDialog,
     AutoLabelingWidget,
@@ -87,8 +89,10 @@ from .widgets import (
     OverviewDialog,
     Popup,
     SearchBar,
+    SplitManagerDialog,
     ToolBar,
     UniqueLabelQListWidget,
+    VersionControlDialog,
     ZoomWidget,
     NavigatorDialog,
 )
@@ -136,6 +140,8 @@ class LabelingWidget(LabelDialog):
         self.fn_to_index = {}
         self.cache_auto_label = None
         self.cache_auto_label_group_id = None
+        self.split_manager = None
+        self.version_manager = None
 
         # see configs/anylabeling_config.yaml for valid configuration
         if config is None:
@@ -1537,6 +1543,36 @@ class LabelingWidget(LabelDialog):
             tip=self.tr("Export Custom VLM-R1 OVD Annotations"),
         )
 
+        # Dataset management actions
+        import_dataset = action(
+            self.tr("Import Dataset"),
+            lambda: utils.import_dataset_dialog(self),
+            None,
+            "folder",
+            self.tr("Import a structured dataset folder or ZIP archive"),
+        )
+        export_dataset = action(
+            self.tr("Export Dataset"),
+            lambda: utils.export_dataset_dialog(self),
+            None,
+            "folder",
+            self.tr("Export dataset with format and split structure"),
+        )
+        split_management = action(
+            self.tr("Split Management"),
+            self.open_split_management,
+            shortcuts.get("split_management"),
+            None,
+            self.tr("Manage train/test/val dataset splits"),
+        )
+        version_control = action(
+            self.tr("Version Control"),
+            self.open_version_control,
+            shortcuts.get("version_control"),
+            None,
+            self.tr("Manage annotation version snapshots"),
+        )
+
         # Group zoom controls into a list for easier toggling.
         zoom_actions = (
             self.zoom_widget,
@@ -1696,6 +1732,10 @@ class LabelingWidget(LabelDialog):
             export_pporc_rec_annotation=export_pporc_rec_annotation,
             export_pporc_kie_annotation=export_pporc_kie_annotation,
             export_vlm_r1_ovd_annotation=export_vlm_r1_ovd_annotation,
+            import_dataset=import_dataset,
+            export_dataset=export_dataset,
+            split_management=split_management,
+            version_control=version_control,
             zoom=zoom,
             zoom_in=zoom_in,
             zoom_out=zoom_out,
@@ -1887,6 +1927,9 @@ class LabelingWidget(LabelDialog):
                 delete_file,
                 delete_image_file,
                 None,
+                import_dataset,
+                export_dataset,
+                None,
             ),
         )
         utils.add_actions(self.menus.train, (ultralytics_train,))
@@ -1903,6 +1946,9 @@ class LabelingWidget(LabelDialog):
                 shape_manager,
                 None,
                 shape_converter,
+                None,
+                split_management,
+                version_control,
             ),
         )
         utils.add_actions(
@@ -2107,6 +2153,12 @@ class LabelingWidget(LabelDialog):
         )
         self.auto_labeling_widget.clear_auto_decode_requested.connect(
             self.canvas.reset_auto_decode_state
+        )
+        self.auto_labeling_widget.smart_select_mode_changed.connect(
+            self.canvas.set_smart_select_mode
+        )
+        self.auto_labeling_widget.undo_last_mark_requested.connect(
+            self.canvas.undo_last_auto_labeling_mark
         )
         self.canvas.auto_decode_requested.connect(
             self.on_auto_decode_requested
@@ -6055,6 +6107,86 @@ class LabelingWidget(LabelDialog):
 
         if image_files and self._config.get("exif_scan_enabled", True):
             self.async_exif_scanner.start_scan(image_files)
+
+        # Initialize split and version managers for the opened directory
+        try:
+            self.split_manager = SplitManager(
+                dirpath, self.output_dir
+            )
+            self.split_manager.sync_with_image_list(
+                [osp.basename(f) for f in self.image_list]
+            )
+            if self.split_manager.has_splits():
+                utils.update_file_list_split_indicators(
+                    self.file_list_widget, self.split_manager
+                )
+        except Exception as e:
+            logger.warning("Failed to initialize split manager: %s", e)
+            self.split_manager = None
+
+        try:
+            self.version_manager = VersionManager(
+                dirpath, self.output_dir
+            )
+        except Exception as e:
+            logger.warning("Failed to initialize version manager: %s", e)
+            self.version_manager = None
+
+    def open_split_management(self):
+        """Open the split management dialog."""
+        if not self.filename:
+            popup = Popup(
+                self.tr("Please load an image folder before proceeding!"),
+                self,
+            )
+            popup.show_popup(self, position="center")
+            return
+
+        if self.split_manager is None:
+            dirpath = osp.dirname(self.filename)
+            self.split_manager = SplitManager(
+                dirpath, self.output_dir
+            )
+            self.split_manager.sync_with_image_list(
+                [osp.basename(f) for f in self.image_list]
+            )
+
+        label_dir = self.output_dir or osp.dirname(self.filename)
+        dialog = SplitManagerDialog(
+            self.split_manager,
+            self.image_list,
+            label_dir,
+            parent=self,
+        )
+        if dialog.exec():
+            utils.update_file_list_split_indicators(
+                self.file_list_widget, self.split_manager
+            )
+
+    def open_version_control(self):
+        """Open the version control dialog."""
+        if not self.filename:
+            popup = Popup(
+                self.tr("Please load an image folder before proceeding!"),
+                self,
+            )
+            popup.show_popup(self, position="center")
+            return
+
+        if self.version_manager is None:
+            dirpath = osp.dirname(self.filename)
+            self.version_manager = VersionManager(
+                dirpath, self.output_dir
+            )
+
+        label_dir = self.output_dir or osp.dirname(self.filename)
+        dialog = VersionControlDialog(
+            self.version_manager,
+            self.image_list,
+            label_dir,
+            parent=self,
+        )
+        dialog.exec()
 
     def toggle_auto_labeling_widget(self):
         """Toggle auto labeling widget visibility."""

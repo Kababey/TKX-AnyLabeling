@@ -355,6 +355,23 @@
       </widget>
      </item>
      <item>
+      <widget class="QPushButton" name="button_undo_mark">
+       <property name="text">
+        <string>Undo Mark</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="button_smart_select">
+       <property name="text">
+        <string>Smart (Off)</string>
+       </property>
+       <property name="checkable">
+        <bool>true</bool>
+       </property>
+      </widget>
+     </item>
+     <item>
       <widget class="QPushButton" name="button_auto_decode">
        <property name="text">
         <string>AMD (Off)</string>

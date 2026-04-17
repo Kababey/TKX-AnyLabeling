@@ -65,6 +65,8 @@ class AutoLabelingWidget(QWidget):
     cropping_mode_changed = pyqtSignal(bool)
     clear_auto_decode_requested = pyqtSignal()
     mask_fineness_changed = pyqtSignal(float)
+    smart_select_mode_changed = pyqtSignal(bool)
+    undo_last_mark_requested = pyqtSignal()
 
     supported_remote_widgets = [
         "button_send",
@@ -160,6 +162,8 @@ class AutoLabelingWidget(QWidget):
             self.button_clear.setEnabled(enable)
             self.button_finish_object.setEnabled(enable)
             self.button_auto_decode.setEnabled(enable)
+            self.button_smart_select.setEnabled(enable)
+            self.button_undo_mark.setEnabled(enable)
             self.button_cropping.setEnabled(enable)
             self.button_skip_detection.setEnabled(enable)
             self.upn_select_combobox.setEnabled(enable)
@@ -301,6 +305,24 @@ class AutoLabelingWidget(QWidget):
         # --- Configuration for: button_finish_object ---
         self.button_finish_object.setText(self.tr("Finish (f)"))
         self.button_finish_object.clicked.connect(self.on_finish_clicked)
+
+        # --- Configuration for: button_undo_mark ---
+        self.button_undo_mark.setStyleSheet(get_normal_button_style())
+        self.button_undo_mark.setText(self.tr("Undo Mark"))
+        self.button_undo_mark.clicked.connect(self.on_undo_mark_clicked)
+        self.button_undo_mark.setToolTip(
+            self.tr("Undo the last auto-labeling prompt mark")
+        )
+
+        # --- Configuration for: button_smart_select ---
+        self.button_smart_select.setStyleSheet(get_normal_button_style())
+        self.button_smart_select.clicked.connect(self.on_smart_select_toggled)
+        self.button_smart_select.setToolTip(
+            self.tr(
+                "Smart Select mode: left-click to add positive points, "
+                "right-click to add negative points. No need to switch modes."
+            )
+        )
 
         # --- Configuration for: button_auto_decode ---
         self.button_auto_decode.setStyleSheet(get_normal_button_style())
@@ -1109,6 +1131,8 @@ class AutoLabelingWidget(QWidget):
             "button_auto_decode",
             "button_cropping",
             "button_skip_detection",
+            "button_smart_select",
+            "button_undo_mark",
             "mask_fineness_slider",
             "mask_fineness_value_label",
         ]
@@ -1554,6 +1578,26 @@ class AutoLabelingWidget(QWidget):
             self.button_auto_decode.setStyleSheet(get_normal_button_style())
 
         self.auto_decode_mode_changed.emit(is_checked)
+
+    def on_smart_select_toggled(self):
+        """Handle Smart Select button toggle"""
+        is_checked = self.button_smart_select.isChecked()
+        self.button_smart_select.setText(
+            self.tr("Smart (On)") if is_checked else self.tr("Smart (Off)")
+        )
+
+        if is_checked:
+            self.button_smart_select.setStyleSheet(
+                get_toggle_button_style(button_color="#90EE90")
+            )
+        else:
+            self.button_smart_select.setStyleSheet(get_normal_button_style())
+
+        self.smart_select_mode_changed.emit(is_checked)
+
+    def on_undo_mark_clicked(self):
+        """Handle undo mark button click"""
+        self.undo_last_mark_requested.emit()
 
     def on_cropping_toggled(self):
         """Handle TinyObj button toggle"""

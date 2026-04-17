@@ -24,7 +24,9 @@ from .navigator_widget import NavigatorDialog
 from .overview_dialog import OverviewDialog
 from .polygon_sides_dialog import PolygonSidesDialog
 from .popup import Popup
+from .split_dialog import SplitManagerDialog
 from .toolbar import ToolBar
 from .unique_label_qlist_widget import UniqueLabelQListWidget
+from .version_control_dialog import VersionControlDialog
 from .vqa_dialog import VQADialog
 from .zoom_widget import ZoomWidget
