@@ -25,6 +25,7 @@ from .overview_dialog import OverviewDialog
 from .polygon_sides_dialog import PolygonSidesDialog
 from .annotation_queue_dock import AnnotationQueueDock
 from .class_manager_dialog import ClassManagerDialog
+from .class_mapping_dialog import ClassMappingDialog
 from .dataset_health_dialog import DatasetHealthDialog
 from .image_manager_dialog import AddImagesDialog
 from .popup import Popup

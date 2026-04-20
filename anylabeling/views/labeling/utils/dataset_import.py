@@ -5,6 +5,8 @@ formats (YOLO, COCO, VOC, DOTA, XLABEL) with auto-detection, preview,
 and background conversion to X-AnyLabeling's native JSON format.
 """
 
+import glob
+import json
 import os
 import os.path as osp
 import shutil
@@ -15,7 +17,10 @@ import zipfile
 from PyQt6 import QtWidgets
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
+    QButtonGroup,
+    QGroupBox,
     QHBoxLayout,
+    QRadioButton,
     QVBoxLayout,
     QProgressDialog,
 )
@@ -92,6 +97,138 @@ _IMPORTABLE_FORMATS = [
     DatasetFormat.DOTA,
     DatasetFormat.XLABEL,
 ]
+
+
+def _merge_into_current_project(self, active_project, result_dir, image_list):
+    """Post-import merge workflow: class mapping, augment project classes,
+    assign a split, and refresh the UI. Kept out of ``on_finished`` to
+    keep that closure readable and to make the control flow testable.
+    """
+    from anylabeling.views.labeling.utils.dataset_export import (
+        _auto_detect_classes,
+    )
+    from anylabeling.views.labeling.widgets.class_mapping_dialog import (
+        ClassMappingDialog,
+    )
+
+    incoming_classes = _auto_detect_classes(image_list, result_dir)
+    existing_classes = [c.get("name") for c in active_project.classes or []]
+    existing_names = [n for n in existing_classes if n]
+
+    mapping = {name: name for name in incoming_classes}
+    if incoming_classes:
+        dlg = ClassMappingDialog(
+            incoming_classes, existing_names, parent=self
+        )
+        if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            mapping = dlg.result_mapping()
+
+    pairs = [(src, dst) for src, dst in mapping.items() if src != dst]
+    try:
+        _apply_mapping_to_dir(result_dir, pairs)
+    except Exception as exc:
+        logger.debug("Class mapping rewrite failed: %s", exc)
+
+    try:
+        new_final_names = set(mapping.values()) - set(existing_names)
+        if new_final_names:
+            merged = list(active_project.classes or [])
+            for n in sorted(new_final_names):
+                merged.append({"name": n, "color": "#888888"})
+            self.project_manager.update_classes(active_project, merged)
+    except Exception as exc:
+        logger.debug("Failed to augment project classes: %s", exc)
+
+    # Reload from the PROJECT images dir so the list includes both the
+    # newly imported images and any pre-existing ones.
+    self.import_image_folder(
+        self.project_manager.get_images_dir(active_project)
+    )
+    try:
+        self.project_manager.update_stats(
+            active_project,
+            image_count=len(self.image_list),
+            annotated_count=sum(
+                1 for p in self.image_list
+                if osp.isfile(
+                    osp.join(
+                        result_dir,
+                        osp.splitext(osp.basename(p))[0] + ".json",
+                    )
+                )
+            ),
+            total_shapes=active_project.stats.get("total_shapes", 0),
+        )
+    except Exception as exc:
+        logger.debug("Failed to update project stats: %s", exc)
+
+    # Offer split assignment for just the newly added images.
+    split_mgr = getattr(self, "split_manager", None)
+    if split_mgr is not None:
+        choices = [
+            self.tr("train"),
+            self.tr("val"),
+            self.tr("test"),
+            self.tr("unassigned"),
+            self.tr("skip"),
+        ]
+        picked, ok = QtWidgets.QInputDialog.getItem(
+            self,
+            self.tr("Assign split"),
+            self.tr(
+                "Assign the %d newly imported image(s) to which split?"
+            ) % len(image_list),
+            choices,
+            0,
+            False,
+        )
+        if ok and picked and picked != self.tr("skip"):
+            split_name = {
+                self.tr("train"): "train",
+                self.tr("val"): "val",
+                self.tr("test"): "test",
+                self.tr("unassigned"): "unassigned",
+            }.get(picked, picked)
+            try:
+                for img in image_list:
+                    split_mgr.set_partition(img, split_name)
+                split_mgr.save_splits()
+            except Exception as exc:
+                logger.debug("Failed to apply split: %s", exc)
+
+
+def _apply_mapping_to_dir(ann_dir, pairs):
+    """Rewrite shape labels in every JSON under ``ann_dir`` per ``pairs``.
+
+    ``pairs`` is an iterable of ``(src_label, dst_label)``. Files with no
+    changed labels are left untouched; corrupt JSONs are skipped so one
+    bad file cannot abort the batch mapping.
+    """
+    if not pairs:
+        return
+    from anylabeling.views.labeling.utils.project_manager import (
+        _atomic_write_json,
+    )
+
+    mapping = dict(pairs)
+    for jp in glob.glob(osp.join(ann_dir, "*.json")):
+        try:
+            with open(jp, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        changed = False
+        for shape in data.get("shapes", []):
+            if not isinstance(shape, dict):
+                continue
+            lbl = shape.get("label")
+            if lbl in mapping and mapping[lbl] != lbl:
+                shape["label"] = mapping[lbl]
+                changed = True
+        if changed:
+            _atomic_write_json(jp, data)
 
 
 def _format_display_name(fmt):
@@ -814,23 +951,37 @@ def import_dataset_dialog(self):
     main_layout.setContentsMargins(24, 24, 24, 24)
     main_layout.setSpacing(16)
 
-    # --- Project context banner ---
+    # --- Import destination: new project vs. merge into current ---
     active_project = getattr(self, "current_project", None)
+    dest_group = QGroupBox(self.tr("Import destination"))
+    dest_layout = QVBoxLayout(dest_group)
+    dest_layout.setSpacing(6)
+
+    dest_button_group = QButtonGroup(dialog)
+    radio_create = QRadioButton(
+        self.tr("Create new project (from source on disk)")
+    )
     if active_project is not None:
-        banner = QtWidgets.QLabel(
-            self.tr(
-                "Project active: <b>%s</b><br/>"
-                "Images will be copied into the project and "
-                "annotations will be saved inside it."
-            ) % active_project.name
+        radio_merge = QRadioButton(
+            self.tr("Merge into current project: %s") % active_project.name
         )
-        banner.setTextFormat(Qt.TextFormat.RichText)
-        banner.setWordWrap(True)
-        banner.setStyleSheet(
-            "QLabel { background: #e3f2fd; color: #0d47a1;"
-            " border-radius: 6px; padding: 10px; }"
+    else:
+        radio_merge = QRadioButton(self.tr("Merge into current project"))
+        radio_merge.setEnabled(False)
+        radio_merge.setToolTip(
+            self.tr("Open a project first to use merge mode.")
         )
-        main_layout.addWidget(banner)
+    dest_button_group.addButton(radio_create)
+    dest_button_group.addButton(radio_merge)
+    dest_layout.addWidget(radio_create)
+    dest_layout.addWidget(radio_merge)
+
+    if active_project is not None:
+        radio_merge.setChecked(True)
+    else:
+        radio_create.setChecked(True)
+
+    main_layout.addWidget(dest_group)
 
     # --- Section 1: Source path (read-only) ---
     src_path_layout = QVBoxLayout()
@@ -991,61 +1142,77 @@ def import_dataset_dialog(self):
     classes_layout.addLayout(classes_path_layout)
     main_layout.addLayout(classes_layout)
 
-    # --- Section 5: Output directory ---
+    # --- Section 5: Output directory (adapts to destination radio) ---
     output_layout = QVBoxLayout()
+    output_label = QtWidgets.QLabel(
+        self.tr("Output directory for converted annotations")
+    )
+    output_layout.addWidget(output_label)
 
+    output_input_layout = QHBoxLayout()
+    output_input_layout.setSpacing(8)
+    output_edit = QtWidgets.QLineEdit()
+    output_edit.setPlaceholderText(self.tr("Select Output Directory"))
+    if zipfile.is_zipfile(source_path):
+        default_output = osp.join(
+            osp.dirname(source_path), "xlabel_annotations"
+        )
+    else:
+        default_output = osp.join(source_path, "xlabel_annotations")
+    create_default_output = osp.realpath(default_output)
+
+    project_ann_dir = None
     if active_project is not None:
-        # Project-managed output: locked to project's annotations dir
         project_ann_dir = getattr(self, "project_manager").get_annotations_dir(
             active_project
         )
-        output_label = QtWidgets.QLabel(
-            self.tr("Annotations output (project-managed)")
+
+    def browse_output_dir():
+        path = QtWidgets.QFileDialog.getExistingDirectory(
+            dialog,
+            self.tr("Select Output Directory"),
+            output_edit.text(),
+            QtWidgets.QFileDialog.Option.DontUseNativeDialog,
         )
-        output_layout.addWidget(output_label)
+        if path:
+            output_edit.setText(path)
 
-        output_edit = QtWidgets.QLineEdit()
-        output_edit.setText(project_ann_dir)
-        output_edit.setReadOnly(True)
-        output_edit.setStyleSheet("background: #f5f5f5;")
-        output_layout.addWidget(output_edit)
-    else:
-        output_label = QtWidgets.QLabel(
-            self.tr("Output directory for converted annotations")
-        )
-        output_layout.addWidget(output_label)
+    output_browse_btn = QtWidgets.QPushButton(self.tr("Browse"))
+    output_browse_btn.clicked.connect(browse_output_dir)
+    output_browse_btn.setStyleSheet(get_cancel_btn_style())
 
-        output_input_layout = QHBoxLayout()
-        output_input_layout.setSpacing(8)
+    output_input_layout.addWidget(output_edit)
+    output_input_layout.addWidget(output_browse_btn)
+    output_layout.addLayout(output_input_layout)
 
-        output_edit = QtWidgets.QLineEdit()
-        # Default output directory: next to source path
-        if zipfile.is_zipfile(source_path):
-            default_output = osp.join(
-                osp.dirname(source_path), "xlabel_annotations"
+    def _sync_output_for_destination():
+        if radio_merge.isChecked() and project_ann_dir:
+            output_edit.setText(project_ann_dir)
+            output_edit.setReadOnly(True)
+            output_edit.setStyleSheet("background: #f5f5f5;")
+            output_browse_btn.setEnabled(False)
+            output_label.setText(
+                self.tr("Annotations output (project-managed)")
             )
         else:
-            default_output = osp.join(source_path, "xlabel_annotations")
-        output_edit.setText(osp.realpath(default_output))
-        output_edit.setPlaceholderText(self.tr("Select Output Directory"))
-
-        def browse_output_dir():
-            path = QtWidgets.QFileDialog.getExistingDirectory(
-                dialog,
-                self.tr("Select Output Directory"),
-                output_edit.text(),
-                QtWidgets.QFileDialog.Option.DontUseNativeDialog,
+            output_edit.setReadOnly(False)
+            output_edit.setStyleSheet("")
+            output_browse_btn.setEnabled(True)
+            output_label.setText(
+                self.tr("Output directory for converted annotations")
             )
-            if path:
-                output_edit.setText(path)
+            if not output_edit.text() or output_edit.text() == (
+                project_ann_dir or ""
+            ):
+                output_edit.setText(create_default_output)
 
-        output_browse_btn = QtWidgets.QPushButton(self.tr("Browse"))
-        output_browse_btn.clicked.connect(browse_output_dir)
-        output_browse_btn.setStyleSheet(get_cancel_btn_style())
-
-        output_input_layout.addWidget(output_edit)
-        output_input_layout.addWidget(output_browse_btn)
-        output_layout.addLayout(output_input_layout)
+    radio_create.toggled.connect(
+        lambda _checked: _sync_output_for_destination()
+    )
+    radio_merge.toggled.connect(
+        lambda _checked: _sync_output_for_destination()
+    )
+    _sync_output_for_destination()
 
     main_layout.addLayout(output_layout)
 
@@ -1169,11 +1336,17 @@ def import_dataset_dialog(self):
     if chosen_format != detected_fmt:
         format_override = chosen_format
 
-    # Project integration: copy images into project dir if active
+    merge_mode = (
+        active_project is not None and radio_merge.isChecked()
+    )
+
+    # Project integration: copy images into project dir only in merge mode.
+    # When the user picked "Create new project" we leave images in source and
+    # fall through to the legacy non-project code path on completion.
     project_images_dir = None
     target_resolution = None
     resize_mode = "none"
-    if active_project is not None:
+    if merge_mode:
         project_images_dir = self.project_manager.get_images_dir(
             active_project
         )
@@ -1227,41 +1400,23 @@ def import_dataset_dialog(self):
             popup.show_popup(self, popup_height=85, position="center")
 
             # ----------------------------------------------------------
-            # Step 5: Load images
+            # Step 5: Load images (+ optional merge-mode bookkeeping)
             # ----------------------------------------------------------
             if image_list:
                 # Set the output_dir so annotations are loaded from there
                 self.output_dir = result_dir
-                if active_project is not None:
-                    # Reload from the PROJECT images dir so we pick up
-                    # newly copied images AND any pre-existing ones.
-                    self.import_image_folder(
-                        self.project_manager.get_images_dir(active_project)
+                if merge_mode:
+                    _merge_into_current_project(
+                        self, active_project, result_dir, image_list
                     )
-                    # Update project stats
-                    try:
-                        self.project_manager.update_stats(
-                            active_project,
-                            image_count=len(self.image_list),
-                            annotated_count=sum(
-                                1 for p in self.image_list
-                                if osp.isfile(
-                                    osp.join(
-                                        result_dir,
-                                        osp.splitext(osp.basename(p))[0] + ".json"
-                                    )
-                                )
-                            ),
-                            total_shapes=active_project.stats.get(
-                                "total_shapes", 0
-                            ),
-                        )
-                    except Exception as exc:
-                        logger.debug("Failed to update project stats: %s", exc)
                 else:
                     # Legacy behavior: load from the source dataset dir
                     first_image_dir = osp.dirname(image_list[0])
                     self.import_image_folder(first_image_dir)
+            try:
+                self._refresh_annotation_queue()
+            except Exception:
+                pass
         else:
             message = self.tr(
                 "Error occurred while importing dataset:\n%s"
