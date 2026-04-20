@@ -105,8 +105,11 @@ dev = [
 ]
 
 # CPU version: Latest ONNX + ONNXRuntime
+# numpy pinned <2 because LABEL_COLORMAP row assignment in label_widget.py relies
+# on numpy 1.x writable-row semantics. opencv<4.10 matches the numpy-1 ABI.
 cpu = [
-    "numpy>=2.0.0",
+    "numpy>=1.26.0,<2.0.0",
+    "opencv-contrib-python-headless>=4.7.0.72,<4.10.0",
     "onnx>=1.15.0",
     "onnxruntime>=1.15.0",
 ]
@@ -119,6 +122,7 @@ gpu = [
 # CUDA 11.x: ONNX < 1.16.1 + ONNXRuntime GPU < 1.19
 gpu-cu11 = [
     "numpy<2.0.0",
+    "opencv-contrib-python-headless>=4.7.0.72,<4.10.0",
     "onnx>=1.15.0,<1.16.1",
     "onnxruntime-gpu>=1.15.0,<1.19.0; platform_system != 'Darwin'",
 ]
