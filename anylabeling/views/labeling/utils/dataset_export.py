@@ -935,13 +935,54 @@ def export_dataset_dialog(self):
     color_map = None
     converter = None
 
+    # ---- project-aware re-scan: newly-added images on disk may not yet be
+    # reflected in self.image_list (the cache populated by import_image_folder),
+    # so when a project is active we rebuild from the images directory.
+    active_project = getattr(self, "current_project", None)
+    pm = getattr(self, "project_manager", None)
+    image_list_override = None
+    label_dir_override = None
+    if active_project is not None and pm is not None:
+        images_dir = pm.get_images_dir(active_project)
+        annotations_dir = pm.get_annotations_dir(active_project)
+        try:
+            from anylabeling.views.labeling import utils as _lbl_utils
+            disk_images = sorted(_lbl_utils.scan_all_images(images_dir))
+        except Exception:
+            disk_images = list(self.image_list or [])
+        cached = set(self.image_list or [])
+        missing = [p for p in disk_images if p not in cached]
+        if missing:
+            try:
+                Popup(
+                    self.tr(
+                        "%d newly-added image(s) detected on disk; "
+                        "refreshing list before export."
+                    )
+                    % len(missing),
+                    self,
+                ).show_popup(self, position="center")
+            except Exception:
+                pass
+            try:
+                self.import_image_folder(images_dir)
+            except Exception:
+                pass
+        image_list_override = disk_images
+        label_dir_override = annotations_dir
+
     # ---- image list (needed early for auto-detection) ----
-    image_list = self.image_list if self.image_list else [self.filename]
+    image_list = image_list_override or (
+        self.image_list if self.image_list else [self.filename]
+    )
 
     # ---- label directory (needed early for auto-detection) ----
-    label_dir_path = osp.dirname(self.filename)
-    if self.output_dir:
-        label_dir_path = self.output_dir
+    if label_dir_override:
+        label_dir_path = label_dir_override
+    else:
+        label_dir_path = osp.dirname(self.filename)
+        if self.output_dir:
+            label_dir_path = self.output_dir
 
     if format_name in FORMATS_NEEDING_CLASSES:
         if classes_path and not osp.isfile(classes_path):
