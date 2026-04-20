@@ -141,10 +141,147 @@ class ClassRenameThread(QThread):
             self.finished.emit(False, str(exc), files_changed, shapes_changed)
 
 
+class ExtractClassesThread(QThread):
+    """Copy a subset of classes + their images to a new project directory.
+
+    Iterates every annotation JSON in ``src_annotations_dir``, keeps only
+    shapes whose label is in ``selected_labels``, and — when any shape is
+    kept — copies the matching image and writes the filtered JSON into
+    ``dst_root`` under ``images/`` and ``annotations/``.
+    """
+
+    _IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff")
+
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal(bool, str, int, int)  # success, error, images_copied, shapes_kept
+
+    def __init__(
+        self,
+        src_images_dir: str,
+        src_annotations_dir: str,
+        dst_root: str,
+        selected_labels: List[str],
+        keep_only_selected: bool = True,
+    ):
+        super().__init__()
+        self.src_images_dir = src_images_dir
+        self.src_annotations_dir = src_annotations_dir
+        self.dst_root = dst_root
+        self.selected_labels = set(selected_labels)
+        self.keep_only_selected = keep_only_selected
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def _find_image(self, stem: str) -> Optional[str]:
+        for ext in self._IMAGE_EXTS:
+            cand = osp.join(self.src_images_dir, stem + ext)
+            if osp.isfile(cand):
+                return cand
+            cand_up = osp.join(self.src_images_dir, stem + ext.upper())
+            if osp.isfile(cand_up):
+                return cand_up
+        return None
+
+    def run(self):
+        import shutil as _sh
+
+        dst_images = osp.join(self.dst_root, "images")
+        dst_anns = osp.join(self.dst_root, "annotations")
+        os.makedirs(dst_images, exist_ok=True)
+        os.makedirs(dst_anns, exist_ok=True)
+
+        if osp.isdir(self.src_annotations_dir):
+            json_paths = sorted(
+                osp.join(self.src_annotations_dir, f)
+                for f in os.listdir(self.src_annotations_dir)
+                if f.lower().endswith(".json")
+            )
+        else:
+            json_paths = []
+
+        total = len(json_paths)
+        images_copied = 0
+        shapes_kept = 0
+
+        try:
+            for idx, jp in enumerate(json_paths, 1):
+                if self._cancelled:
+                    break
+                try:
+                    with open(jp, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                except (OSError, json.JSONDecodeError) as exc:
+                    logger.warning("Skipping '%s': %s", jp, exc)
+                    self.progress.emit(idx, total)
+                    continue
+                if not isinstance(data, dict):
+                    self.progress.emit(idx, total)
+                    continue
+
+                shapes = data.get("shapes", [])
+                if not isinstance(shapes, list):
+                    self.progress.emit(idx, total)
+                    continue
+
+                kept = [
+                    s for s in shapes
+                    if isinstance(s, dict)
+                    and s.get("label") in self.selected_labels
+                ]
+                if not kept:
+                    self.progress.emit(idx, total)
+                    continue
+
+                stem = osp.splitext(osp.basename(jp))[0]
+                src_img = self._find_image(stem)
+                if src_img is None:
+                    # Fall back to the imagePath recorded in the JSON, if any.
+                    img_rel = data.get("imagePath")
+                    if img_rel:
+                        cand = osp.join(self.src_images_dir, img_rel)
+                        if osp.isfile(cand):
+                            src_img = cand
+                if src_img is None:
+                    logger.debug(
+                        "No image found for '%s' in %s", stem, self.src_images_dir
+                    )
+                    self.progress.emit(idx, total)
+                    continue
+
+                dst_img = osp.join(dst_images, osp.basename(src_img))
+                try:
+                    _sh.copy2(src_img, dst_img)
+                except OSError as exc:
+                    logger.warning("Image copy failed '%s': %s", src_img, exc)
+                    self.progress.emit(idx, total)
+                    continue
+
+                data["shapes"] = kept
+                data["imagePath"] = osp.basename(dst_img)
+                try:
+                    _atomic_write_json(osp.join(dst_anns, osp.basename(jp)), data)
+                except OSError as exc:
+                    logger.warning("Annotation write failed: %s", exc)
+                    self.progress.emit(idx, total)
+                    continue
+
+                images_copied += 1
+                shapes_kept += len(kept)
+                self.progress.emit(idx, total)
+
+            self.finished.emit(True, "", images_copied, shapes_kept)
+        except Exception as exc:
+            logger.error("ExtractClassesThread failed: %s", exc)
+            self.finished.emit(False, str(exc), images_copied, shapes_kept)
+
+
 class ClassManagerDialog(QDialog):
     """Manage classes: rename, merge, delete, set colors."""
 
     classes_changed = pyqtSignal(list)  # emits updated class list
+    extract_requested = pyqtSignal(list, str, str)  # classes, target_dir, project_name
 
     def __init__(
         self,
@@ -226,10 +363,14 @@ class ClassManagerDialog(QDialog):
         self.delete_btn = QPushButton(self.tr("Delete..."))
         self.delete_btn.setStyleSheet(get_cancel_btn_style())
         self.delete_btn.clicked.connect(self._on_delete)
+        self.extract_btn = QPushButton(self.tr("Extract to new project..."))
+        self.extract_btn.setStyleSheet(get_cancel_btn_style())
+        self.extract_btn.clicked.connect(self._on_extract)
         actions_row.addWidget(self.add_btn)
         actions_row.addWidget(self.rename_btn)
         actions_row.addWidget(self.merge_btn)
         actions_row.addWidget(self.delete_btn)
+        actions_row.addWidget(self.extract_btn)
         actions_row.addStretch()
         layout.addLayout(actions_row)
 
@@ -443,6 +584,62 @@ class ClassManagerDialog(QDialog):
 
         self._classes = [c for c in self._classes if c["name"] not in names]
         self._run_rename_thread("delete", names, None)
+
+    def _on_extract(self) -> None:
+        from PyQt6.QtWidgets import QFileDialog
+
+        names = self._selected_class_names()
+        if not names:
+            QMessageBox.information(
+                self,
+                self.tr("No classes selected"),
+                self.tr(
+                    "Please select one or more classes to extract into "
+                    "a new project."
+                ),
+            )
+            return
+
+        target_dir = QFileDialog.getExistingDirectory(
+            self,
+            self.tr("Select an empty directory for the new project"),
+            "",
+            QFileDialog.Option.DontUseNativeDialog,
+        )
+        if not target_dir:
+            return
+
+        try:
+            if os.listdir(target_dir):
+                QMessageBox.warning(
+                    self,
+                    self.tr("Directory not empty"),
+                    self.tr(
+                        "The selected directory already contains files. "
+                        "Please pick an empty directory."
+                    ),
+                )
+                return
+        except OSError as exc:
+            QMessageBox.critical(
+                self,
+                self.tr("Cannot access directory"),
+                self.tr("Could not read the target directory:\n%s") % exc,
+            )
+            return
+
+        default_name = osp.basename(osp.normpath(target_dir)) or "extracted"
+        name, ok = QInputDialog.getText(
+            self,
+            self.tr("Project name"),
+            self.tr("Enter a name for the new project:"),
+            text=default_name,
+        )
+        if not ok:
+            return
+        name = (name or "").strip() or default_name
+
+        self.extract_requested.emit(names, target_dir, name)
 
     def _run_rename_thread(
         self, action: str, from_labels: List[str], to_label: Optional[str]

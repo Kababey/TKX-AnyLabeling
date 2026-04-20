@@ -6397,7 +6397,109 @@ class LabelingWidget(LabelDialog):
             parent=self,
         )
         dialog.classes_changed.connect(self._on_project_classes_changed)
+        dialog.extract_requested.connect(self._on_extract_classes_requested)
         dialog.exec()
+
+    def _on_extract_classes_requested(self, classes, target_dir, name):
+        """Copy annotations+images for the selected classes to a new project."""
+        from .widgets.class_manager_dialog import ExtractClassesThread
+
+        if not classes or not target_dir or not name:
+            return
+
+        if self.current_project is not None:
+            src_images_dir = self.project_manager.get_images_dir(
+                self.current_project
+            )
+            src_annotations_dir = self.project_manager.get_annotations_dir(
+                self.current_project
+            )
+            src_classes_dicts = [
+                c for c in (self.current_project.classes or [])
+                if c.get("name") in classes
+            ]
+            base_settings = dict(self.current_project.settings or {})
+        else:
+            if not self.filename:
+                return
+            src_images_dir = osp.dirname(self.filename)
+            src_annotations_dir = self.output_dir or src_images_dir
+            src_classes_dicts = [
+                {"name": n, "color": "#888888"} for n in classes
+            ]
+            base_settings = {}
+
+        progress = QtWidgets.QProgressDialog(
+            self.tr("Extracting classes to %s ...") % name,
+            self.tr("Cancel"),
+            0,
+            0,
+            self,
+        )
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setWindowTitle(self.tr("Extracting classes"))
+        progress.setMinimumWidth(420)
+
+        thread = ExtractClassesThread(
+            src_images_dir=src_images_dir,
+            src_annotations_dir=src_annotations_dir,
+            dst_root=target_dir,
+            selected_labels=list(classes),
+            keep_only_selected=True,
+        )
+        self._extract_thread = thread
+
+        def _on_progress(cur, total):
+            if total > 0:
+                progress.setRange(0, total)
+                progress.setValue(cur)
+
+        def _on_finished(success, error, imgs, shapes):
+            progress.close()
+            if not success:
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    self.tr("Extract failed"),
+                    self.tr("An error occurred: %s") % error,
+                )
+                return
+            try:
+                self.project_manager.create_project(
+                    target_dir,
+                    name,
+                    description="",
+                    classes=src_classes_dicts,
+                    settings=base_settings,
+                )
+            except Exception as exc:
+                logger.error("create_project failed after extract: %s", exc)
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    self.tr("Project creation failed"),
+                    self.tr(
+                        "Extracted %d images / %d shapes but could not "
+                        "create the project config:\n%s"
+                    ) % (imgs, shapes, exc),
+                )
+                return
+            reply = QtWidgets.QMessageBox.question(
+                self,
+                self.tr("Open new project?"),
+                self.tr(
+                    "Extracted %d image(s) and %d shape(s) to:\n%s\n\n"
+                    "Open the new project now?"
+                ) % (imgs, shapes, target_dir),
+                QtWidgets.QMessageBox.StandardButton.Yes
+                | QtWidgets.QMessageBox.StandardButton.No,
+            )
+            if reply == QtWidgets.QMessageBox.StandardButton.Yes:
+                self._on_project_opened(target_dir)
+
+        thread.progress.connect(_on_progress)
+        thread.finished.connect(_on_finished)
+        progress.canceled.connect(thread.cancel)
+        progress.show()
+        thread.start()
 
     def _on_project_classes_changed(self, classes):
         """Persist class list to project file if a project is active."""
