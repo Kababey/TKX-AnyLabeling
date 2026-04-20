@@ -74,6 +74,7 @@ from .utils.version_control import VersionManager
 from .widgets import (
     AboutDialog,
     AddImagesDialog,
+    AnnotationQueueDock,
     AutoLabelingWidget,
     BrightnessContrastDialog,
     Canvas,
@@ -325,6 +326,17 @@ class LabelingWidget(LabelDialog):
         file_list_widget.setLayout(file_list_layout)
         self.file_dock.setWidget(file_list_widget)
         self.file_dock.setStyleSheet(get_dock_style())
+
+        self.annotate_queue_dock = AnnotationQueueDock(self)
+        self.annotate_queue_dock.image_selected.connect(
+            self._on_queue_image_selected
+        )
+        self.annotate_queue_dock.mark_reviewed_requested.connect(
+            self._on_queue_mark_reviewed
+        )
+        self.annotate_queue_dock.set_refresh_callback(
+            self._refresh_annotation_queue
+        )
 
         self.zoom_widget = ZoomWidget()
 
@@ -1612,6 +1624,28 @@ class LabelingWidget(LabelDialog):
             "folder",
             self.tr("Manage multiple datasets as projects"),
         )
+        show_annotate_queue = action(
+            self.tr("Show Annotate Queue"),
+            self.toggle_annotation_queue,
+            None,
+            None,
+            self.tr("Toggle the dockable queue of unlabeled images"),
+            checkable=True,
+        )
+        next_unlabeled_action = action(
+            self.tr("Next Unlabeled Image"),
+            self.open_next_unchecked_image,
+            "Ctrl+Shift+N",
+            None,
+            self.tr("Jump to the next image without annotations"),
+        )
+        mark_reviewed_empty_action = action(
+            self.tr("Mark as Reviewed (no objects)"),
+            self.mark_current_reviewed_empty,
+            None,
+            None,
+            self.tr("Record that the current image has no objects"),
+        )
         close_project_action = action(
             self.tr("Close Project"),
             self.close_current_project,
@@ -1788,6 +1822,9 @@ class LabelingWidget(LabelDialog):
             dataset_health_action=dataset_health_action,
             project_manager_action=project_manager_action,
             close_project_action=close_project_action,
+            show_annotate_queue=show_annotate_queue,
+            next_unlabeled_action=next_unlabeled_action,
+            mark_reviewed_empty_action=mark_reviewed_empty_action,
             zoom=zoom,
             zoom_in=zoom_in,
             zoom_out=zoom_out,
@@ -1945,6 +1982,7 @@ class LabelingWidget(LabelDialog):
             export=self.menu(self.tr("Export")),
             tool=self.menu(self.tr("Tool")),
             train=self.menu(self.tr("Train")),
+            annotate=self.menu(self.tr("Annotate")),
             help=self.menu(self.tr("Help")),
             recent_files=QtWidgets.QMenu(self.tr("Open Recent")),
             label_list=label_menu,
@@ -1990,6 +2028,15 @@ class LabelingWidget(LabelDialog):
             ),
         )
         utils.add_actions(self.menus.train, (ultralytics_train,))
+        utils.add_actions(
+            self.menus.annotate,
+            (
+                show_annotate_queue,
+                None,
+                next_unlabeled_action,
+                mark_reviewed_empty_action,
+            ),
+        )
         utils.add_actions(
             self.menus.tool,
             (
@@ -2422,6 +2469,15 @@ class LabelingWidget(LabelDialog):
         files_panel_layout.setSpacing(0)
         files_panel_layout.addWidget(self.file_dock)
         right_sidebar_layout.addWidget(files_panel)
+
+        queue_panel = QFrame()
+        queue_panel.setObjectName("sidebarPanel")
+        queue_panel.setStyleSheet(get_panel_style())
+        queue_panel_layout = QVBoxLayout(queue_panel)
+        queue_panel_layout.setContentsMargins(0, 0, 0, 0)
+        queue_panel_layout.setSpacing(0)
+        queue_panel_layout.addWidget(self.annotate_queue_dock)
+        right_sidebar_layout.addWidget(queue_panel)
         self.file_dock.setFeatures(
             QDockWidget.DockWidgetFeature.DockWidgetFloatable
         )
@@ -4186,6 +4242,10 @@ class LabelingWidget(LabelDialog):
                 if len(items) != 1:
                     raise RuntimeError("There are duplicate files.")
                 items[0].setCheckState(Qt.CheckState.Checked)
+            try:
+                self.annotate_queue_dock.remove_path(self.image_path)
+            except Exception:
+                pass
             # disable allows next and previous image to proceed
             # self.filename = filename
             return True
@@ -4530,6 +4590,10 @@ class LabelingWidget(LabelDialog):
                 if len(items) != 1:
                     raise RuntimeError("There are duplicate files.")
                 items[0].setCheckState(Qt.CheckState.Checked)
+            try:
+                self.annotate_queue_dock.remove_path(self.image_path)
+            except Exception:
+                pass
             # disable allows next and previous image to proceed
             # self.filename = filename
             return True
@@ -6305,6 +6369,7 @@ class LabelingWidget(LabelDialog):
             if new_paths:
                 # Reload the folder to pick up new images
                 self.import_image_folder(target_dir)
+                self._refresh_annotation_queue()
                 popup = Popup(
                     self.tr("Added %d images to dataset") % len(new_paths),
                     self,
@@ -6409,6 +6474,74 @@ class LabelingWidget(LabelDialog):
 
         self.setWindowTitle(f"X-AnyLabeling - {info.name}")
         self._update_project_status_bar()
+        self._refresh_annotation_queue()
+
+    def toggle_annotation_queue(self):
+        """Show/hide the unlabeled-image dock."""
+        if self.annotate_queue_dock.isVisible():
+            self.annotate_queue_dock.hide()
+        else:
+            self._refresh_annotation_queue()
+            self.annotate_queue_dock.show()
+        try:
+            self.actions.show_annotate_queue.setChecked(
+                self.annotate_queue_dock.isVisible()
+            )
+        except Exception:
+            pass
+
+    def _annotations_dir_for_queue(self):
+        if self.current_project is not None:
+            return self.project_manager.get_annotations_dir(
+                self.current_project
+            )
+        if self.output_dir:
+            return self.output_dir
+        if self.filename:
+            return osp.dirname(self.filename)
+        return ""
+
+    def _refresh_annotation_queue(self):
+        try:
+            self.annotate_queue_dock.refresh(
+                self.image_list or [],
+                self._annotations_dir_for_queue(),
+            )
+        except Exception as exc:
+            logger.debug("Failed to refresh annotation queue: %s", exc)
+
+    def _on_queue_image_selected(self, path):
+        if path and osp.isfile(path):
+            self.load_file(path)
+
+    def _on_queue_mark_reviewed(self, path):
+        if not path:
+            return
+        ann_dir = self._annotations_dir_for_queue()
+        if not ann_dir:
+            return
+        try:
+            mark_reviewed_empty(path, ann_dir)
+        except Exception as exc:
+            logger.warning("Failed to mark reviewed-empty: %s", exc)
+            return
+        self.annotate_queue_dock.remove_path(path)
+        items = self.file_list_widget.findItems(
+            path, Qt.MatchFlag.MatchExactly
+        )
+        for it in items:
+            it.setCheckState(Qt.CheckState.Checked)
+
+    def mark_current_reviewed_empty(self):
+        """Mark the currently loaded image as reviewed-with-no-objects."""
+        if not self.filename:
+            popup = Popup(
+                self.tr("No image is currently open."),
+                self,
+            )
+            popup.show_popup(self, position="center")
+            return
+        self._on_queue_mark_reviewed(self.filename)
 
     def close_current_project(self):
         """Close the active project (does not delete any files)."""
