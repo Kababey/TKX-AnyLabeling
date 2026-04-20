@@ -63,6 +63,11 @@ from .utils.file_search import (
     matches_filename,
     matches_label_attribute,
 )
+from .utils.annotation_status import (
+    is_image_annotated,
+    mark_reviewed_empty,
+    scan_unlabeled,
+)
 from .utils.project_manager import ProjectManager
 from .utils.split_manager import SplitManager
 from .utils.version_control import VersionManager
@@ -6135,17 +6140,13 @@ class LabelingWidget(LabelDialog):
                             continue
 
             image_files.append(filename)
-            label_file = osp.splitext(filename)[0] + ".json"
-            if self.output_dir:
-                label_file_without_path = osp.basename(label_file)
-                label_file = self.output_dir + "/" + label_file_without_path
             item = QtWidgets.QListWidgetItem(filename)
             flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
             if self._config.get("file_list_checkbox_editable", False):
                 flags |= Qt.ItemFlag.ItemIsUserCheckable
             item.setFlags(flags)
-            if QtCore.QFile.exists(label_file) and LabelFile.is_label_file(
-                label_file
+            if is_image_annotated(
+                filename, self.output_dir or osp.dirname(filename)
             ):
                 item.setCheckState(Qt.CheckState.Checked)
             else:
