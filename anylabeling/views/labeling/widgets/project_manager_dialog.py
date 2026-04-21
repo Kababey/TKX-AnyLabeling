@@ -20,11 +20,9 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
-    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
-    QGroupBox,
     QHeaderView,
     QSplitter,
     QWidget,
@@ -95,23 +93,13 @@ class NewProjectDialog(QDialog):
         )
         layout.addWidget(self.classes_edit)
 
-        # Target resolution
-        res_group = QGroupBox(self.tr("Target resolution (optional)"))
-        res_layout = QHBoxLayout(res_group)
-        res_layout.addWidget(QLabel(self.tr("Width:")))
-        self.w_edit = QSpinBox()
-        self.w_edit.setRange(0, 16384)
-        self.w_edit.setValue(0)
-        self.w_edit.setSpecialValueText(self.tr("Not set"))
-        res_layout.addWidget(self.w_edit)
-        res_layout.addWidget(QLabel(self.tr("Height:")))
-        self.h_edit = QSpinBox()
-        self.h_edit.setRange(0, 16384)
-        self.h_edit.setValue(0)
-        self.h_edit.setSpecialValueText(self.tr("Not set"))
-        res_layout.addWidget(self.h_edit)
-        res_layout.addStretch()
-        layout.addWidget(res_group)
+        # Resolution preprocessing is intentionally NOT set here. Source
+        # images are kept at their original resolution; per-image dimensions
+        # are derived from the file on disk at save time. If you want to
+        # force a working resolution, set it later from the Add Images
+        # dialog (it has per-import resize controls). This matches the
+        # Roboflow-style flow: ingest first, decide preprocessing at
+        # export/Generate time.
 
         # Buttons
         btn_row = QHBoxLayout()
@@ -181,19 +169,12 @@ class NewProjectDialog(QDialog):
             c.strip() for c in classes_raw.split(",") if c.strip()
         ] if classes_raw else []
 
-        settings = {}
-        tw, th = self.w_edit.value(), self.h_edit.value()
-        if tw > 0 and th > 0:
-            settings["target_resolution"] = [tw, th]
-            settings["auto_resize_new_images"] = True
-
         try:
             info = self._pm.create_project(
                 project_dir=proj_dir,
                 name=name,
                 description=self.desc_edit.toPlainText().strip(),
                 classes=classes,
-                settings=settings,
             )
             self._created_info = info
             self.accept()
