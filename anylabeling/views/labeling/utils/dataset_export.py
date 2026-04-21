@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QProgressDialog,
     QRadioButton,
+    QSpinBox,
     QVBoxLayout,
 )
 
@@ -149,6 +150,8 @@ class DatasetExportThread(QThread):
         skip_empty=False,
         create_zip=False,
         color_map=None,
+        target_resolution=None,
+        resize_mode="none",
     ):
         """
         Args:
@@ -165,6 +168,13 @@ class DatasetExportThread(QThread):
             create_zip: Whether to create a ZIP of the output directory.
             color_map: Mapping table dict for Mask export (required when
                        format_name == "Mask").
+            target_resolution: Optional (width, height) tuple. When set,
+                               images are resized and annotation coordinates
+                               transformed before conversion. Source files
+                               on disk are not touched.
+            resize_mode: One of "letterbox", "center_crop", "stretch", or
+                         "none". Ignored unless ``target_resolution`` is
+                         set to a positive (w, h).
         """
         super().__init__()
         self.image_list = image_list
@@ -177,6 +187,9 @@ class DatasetExportThread(QThread):
         self.skip_empty = skip_empty
         self.create_zip = create_zip
         self.color_map = color_map
+        self.target_resolution = target_resolution
+        self.resize_mode = resize_mode or "none"
+        self._preprocess_dir = None
         self._cancelled = False
 
     # ---- public helpers ----
@@ -663,11 +676,114 @@ class DatasetExportThread(QThread):
                     zf.write(abs_path, arc_name)
         return zip_path
 
+    # ---- export-time resize preprocessing ----
+
+    def _resize_enabled(self):
+        tr = self.target_resolution
+        return (
+            tr is not None
+            and len(tr) == 2
+            and int(tr[0]) > 0
+            and int(tr[1]) > 0
+            and self.resize_mode not in (None, "none", "")
+        )
+
+    def _preprocess_resize(self):
+        """Resize every image in ``self.image_list`` to ``target_resolution``
+        and write coordinate-transformed XLABEL JSONs alongside.
+
+        Mutates ``self.image_list`` and ``self.label_dir_path`` to point at
+        the preprocessed copies so downstream exporters need no changes.
+        Source images and source JSONs are left untouched on disk.
+        """
+        from anylabeling.views.labeling.utils.image_resizer import (
+            ResizeMode,
+            resize_image,
+            transform_annotation,
+        )
+
+        try:
+            mode = ResizeMode(self.resize_mode)
+        except ValueError:
+            logger.warning(
+                "Unknown resize mode '%s'; skipping preprocessing.",
+                self.resize_mode,
+            )
+            return
+
+        tw, th = int(self.target_resolution[0]), int(
+            self.target_resolution[1]
+        )
+        self._preprocess_dir = tempfile.mkdtemp(prefix="xlabel_export_pp_")
+        img_dir = osp.join(self._preprocess_dir, "images")
+        ann_dir = osp.join(self._preprocess_dir, "annotations")
+        os.makedirs(img_dir, exist_ok=True)
+        os.makedirs(ann_dir, exist_ok=True)
+
+        new_image_list = []
+        total = len(self.image_list)
+        for i, src_img in enumerate(self.image_list):
+            if self._cancelled:
+                return
+            basename = osp.basename(src_img)
+            dst_img = osp.join(img_dir, basename)
+            result = resize_image(src_img, dst_img, (tw, th), mode)
+            if not result.success:
+                logger.warning(
+                    "Resize failed for %s: %s. Falling back to original.",
+                    src_img,
+                    result.error,
+                )
+                new_image_list.append(src_img)
+                continue
+            new_image_list.append(dst_img)
+
+            stem = osp.splitext(basename)[0]
+            src_json = osp.join(self.label_dir_path, stem + ".json")
+            if not osp.isfile(src_json):
+                src_json = osp.join(osp.dirname(src_img), stem + ".json")
+            if osp.isfile(src_json):
+                try:
+                    with open(src_json, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    data = transform_annotation(data, result)
+                    data["imagePath"] = basename
+                    data["imageWidth"] = tw
+                    data["imageHeight"] = th
+                    with open(
+                        osp.join(ann_dir, stem + ".json"),
+                        "w",
+                        encoding="utf-8",
+                    ) as f:
+                        json.dump(data, f, ensure_ascii=False, indent=2)
+                except (OSError, ValueError) as exc:
+                    logger.warning(
+                        "Failed to transform annotation for %s: %s",
+                        basename,
+                        exc,
+                    )
+            # one "preprocess" tick per image so the progress bar moves
+            self.progress.emit(i + 1, total)
+
+        self.image_list = new_image_list
+        self.label_dir_path = ann_dir
+
+    def _cleanup_preprocess(self):
+        if self._preprocess_dir and osp.isdir(self._preprocess_dir):
+            shutil.rmtree(self._preprocess_dir, ignore_errors=True)
+        self._preprocess_dir = None
+
     # ---- main entry ----
 
     def run(self):
         try:
             time.sleep(0.3)
+
+            if self._resize_enabled():
+                self._preprocess_resize()
+                if self._cancelled:
+                    self.finished.emit(False, "Export cancelled by user.")
+                    return
 
             if _is_yolo_format(self.format_name):
                 self._export_yolo()
@@ -696,6 +812,8 @@ class DatasetExportThread(QThread):
         except Exception as e:
             logger.error("Dataset export failed: %s", e, exc_info=True)
             self.finished.emit(False, str(e))
+        finally:
+            self._cleanup_preprocess()
 
 
 # ---------------------------------------------------------------------------
@@ -867,7 +985,59 @@ def export_dataset_dialog(self):
     output_path_layout.addWidget(output_button)
     layout.addLayout(output_path_layout)
 
-    # -- 5. Options --
+    # -- 5. Preprocessing (export-time resize, Roboflow-style) --
+    pre_group = QGroupBox(self.tr("Preprocessing (optional)"))
+    pre_layout = QVBoxLayout()
+    pre_layout.setSpacing(8)
+
+    chk_resize = QtWidgets.QCheckBox(
+        self.tr("Resize images to target resolution")
+    )
+    chk_resize.setChecked(False)
+    chk_resize.setToolTip(
+        self.tr(
+            "Resize a copy of each image to the target size at export time.\n"
+            "Annotation coordinates are transformed to match. Source files "
+            "on disk are not modified."
+        )
+    )
+    pre_layout.addWidget(chk_resize)
+
+    pre_row = QHBoxLayout()
+    pre_row.setSpacing(8)
+    pre_row.addWidget(QtWidgets.QLabel(self.tr("Width:")))
+    w_spin = QSpinBox()
+    w_spin.setRange(1, 16384)
+    w_spin.setValue(640)
+    pre_row.addWidget(w_spin)
+    pre_row.addWidget(QtWidgets.QLabel(self.tr("Height:")))
+    h_spin = QSpinBox()
+    h_spin.setRange(1, 16384)
+    h_spin.setValue(640)
+    pre_row.addWidget(h_spin)
+    pre_row.addWidget(QtWidgets.QLabel(self.tr("Mode:")))
+    mode_combo = QComboBox()
+    mode_combo.addItem(self.tr("Letterbox (keep aspect, pad)"), "letterbox")
+    mode_combo.addItem(
+        self.tr("Center crop (keep aspect, crop)"), "center_crop"
+    )
+    mode_combo.addItem(self.tr("Stretch (distort)"), "stretch")
+    pre_row.addWidget(mode_combo)
+    pre_row.addStretch()
+    pre_layout.addLayout(pre_row)
+
+    # Disable resolution controls until the checkbox is enabled.
+    def _sync_resize_controls(checked):
+        for w in (w_spin, h_spin, mode_combo):
+            w.setEnabled(bool(checked))
+
+    chk_resize.toggled.connect(_sync_resize_controls)
+    _sync_resize_controls(False)
+
+    pre_group.setLayout(pre_layout)
+    layout.addWidget(pre_group)
+
+    # -- 6. Options --
     options_group = QGroupBox(self.tr("Options"))
     options_layout = QVBoxLayout()
     options_layout.setSpacing(8)
@@ -920,6 +1090,11 @@ def export_dataset_dialog(self):
     save_images = chk_images.isChecked()
     skip_empty = chk_skip_empty.isChecked()
     create_zip = chk_zip.isChecked()
+    do_resize = chk_resize.isChecked()
+    target_resolution = (
+        (w_spin.value(), h_spin.value()) if do_resize else None
+    )
+    resize_mode = mode_combo.currentData() if do_resize else "none"
 
     # ---- validate ----
     if not output_dir:
@@ -1171,6 +1346,8 @@ def export_dataset_dialog(self):
         skip_empty=skip_empty,
         create_zip=create_zip,
         color_map=color_map,
+        target_resolution=target_resolution,
+        resize_mode=resize_mode,
     )
 
     def on_progress(current, total_count):
