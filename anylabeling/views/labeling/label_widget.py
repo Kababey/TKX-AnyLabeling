@@ -6285,21 +6285,44 @@ class LabelingWidget(LabelDialog):
 
     def open_version_control(self):
         """Open the version control dialog."""
-        if not self.filename:
+        if not self.filename and not self.current_project:
             popup = Popup(
-                self.tr("Please load an image folder before proceeding!"),
+                self.tr(
+                    "Please open a folder or project before proceeding!"
+                ),
                 self,
             )
             popup.show_popup(self, position="center")
             return
 
-        if self.version_manager is None:
-            dirpath = osp.dirname(self.filename)
-            self.version_manager = VersionManager(
-                dirpath, self.output_dir
+        # Prefer project-scoped versioning when a project is active.
+        if self.current_project is not None:
+            project_root = self.current_project.path
+            label_dir = self.project_manager.get_annotations_dir(
+                self.current_project
             )
+            if (
+                self.version_manager is None
+                or osp.normcase(
+                    osp.abspath(self.version_manager.get_versions_root())
+                )
+                != osp.normcase(
+                    osp.abspath(
+                        osp.join(project_root, ".xanylabeling_versions")
+                    )
+                )
+            ):
+                self.version_manager = VersionManager(
+                    project_root, project_root
+                )
+        else:
+            if self.version_manager is None:
+                dirpath = osp.dirname(self.filename)
+                self.version_manager = VersionManager(
+                    dirpath, self.output_dir
+                )
+            label_dir = self.output_dir or osp.dirname(self.filename)
 
-        label_dir = self.output_dir or osp.dirname(self.filename)
         dialog = VersionControlDialog(
             self.version_manager,
             self.image_list,
@@ -6562,6 +6585,16 @@ class LabelingWidget(LabelDialog):
         self.output_dir = annotations_dir
         self.import_image_folder(images_dir)
 
+        # Scope version snapshots to the project root (not the annotations
+        # subdir) so they survive re-opens, stay out of exported datasets,
+        # and follow the project when it moves.
+        try:
+            self.version_manager = VersionManager(info.path, info.path)
+        except Exception as exc:
+            logger.warning(
+                "Failed to re-scope version manager to project: %s", exc
+            )
+
         # Apply project classes to the label dialog if we have them
         if info.classes:
             try:
@@ -6657,6 +6690,9 @@ class LabelingWidget(LabelDialog):
         name = self.current_project.name
         self.project_manager.close_project(self.current_project)
         self.current_project = None
+        # Drop the project-scoped version manager so the next folder/project
+        # gets a fresh one rooted under its own directory.
+        self.version_manager = None
         self.setWindowTitle("X-AnyLabeling")
         self._update_project_status_bar()
         popup = Popup(
