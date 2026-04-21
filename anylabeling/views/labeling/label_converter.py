@@ -333,6 +333,59 @@ class LabelConverter:
             width, height = img.size
             return width, height
 
+    @classmethod
+    def _resolve_image_dims(cls, data, annotation_file):
+        """Return (imageWidth, imageHeight) for an XLABEL annotation dict,
+        falling back to the image file on disk when the JSON is missing or
+        has non-positive dimensions.
+
+        Older/imported annotations (or ones converted by hand) may not
+        carry ``imageWidth`` / ``imageHeight``. Every ``custom_to_*``
+        exporter indexes those keys directly, so a missing key raises
+        ``KeyError: 'imageWidth'`` partway through export and aborts the
+        whole run. Resolving from the image on disk keeps export working
+        and patches the JSON so the next export is free.
+        """
+        w = data.get("imageWidth")
+        h = data.get("imageHeight")
+        if isinstance(w, (int, float)) and isinstance(h, (int, float)) \
+                and w > 0 and h > 0:
+            return int(w), int(h)
+
+        image_path = data.get("imagePath") or ""
+        candidates = []
+        if image_path:
+            if osp.isabs(image_path):
+                candidates.append(image_path)
+            candidates.append(
+                osp.join(osp.dirname(annotation_file), image_path)
+            )
+        # Fallback: sibling image with the same stem as the JSON file.
+        stem = osp.splitext(osp.basename(annotation_file))[0]
+        ann_dir = osp.dirname(annotation_file)
+        for ext in (".jpg", ".jpeg", ".png", ".bmp", ".webp",
+                    ".tif", ".tiff"):
+            candidates.append(osp.join(ann_dir, stem + ext))
+
+        for cand in candidates:
+            if cand and osp.isfile(cand):
+                try:
+                    iw, ih = cls.get_image_size(cand)
+                    if iw > 0 and ih > 0:
+                        data["imageWidth"] = int(iw)
+                        data["imageHeight"] = int(ih)
+                        return int(iw), int(ih)
+                except (OSError, ValueError) as exc:
+                    logger.debug(
+                        "get_image_size failed for '%s': %s", cand, exc
+                    )
+
+        raise KeyError(
+            "Annotation '%s' is missing imageWidth/imageHeight and no "
+            "matching image could be located to recover them."
+            % annotation_file
+        )
+
     @staticmethod
     def get_min_enclosing_bbox(segmentations):
         """
@@ -1206,8 +1259,9 @@ class LabelConverter:
                 pathlib.Path(output_file).touch()
             return is_empty_file
 
-        image_width = data["imageWidth"]
-        image_height = data["imageHeight"]
+        image_width, image_height = self._resolve_image_dims(
+            data, input_file
+        )
         image_size = np.array([[image_width, image_height]])
         if mode == "pose":
             pose_data = {}
@@ -1511,8 +1565,9 @@ class LabelConverter:
                     continue
 
             data = self.read_json(label_file)
-            image_width = data["imageWidth"]
-            image_height = data["imageHeight"]
+            image_width, image_height = self._resolve_image_dims(
+                data, label_file
+            )
             coco_data["images"].append(
                 {
                     "license": 0,
@@ -1709,7 +1764,7 @@ class LabelConverter:
 
     def custom_to_dota(self, input_file, output_file):
         data = self.read_json(input_file)
-        w, h = data["imageWidth"], data["imageHeight"]
+        w, h = self._resolve_image_dims(data, input_file)
         with open(output_file, "w", encoding="utf-8") as f:
             for shape in data["shapes"]:
                 points = shape["points"]
@@ -1737,8 +1792,9 @@ class LabelConverter:
 
     def custom_to_mask(self, input_file, output_file, mapping_table):
         data = self.read_json(input_file)
-        image_width = data["imageWidth"]
-        image_height = data["imageHeight"]
+        image_width, image_height = self._resolve_image_dims(
+            data, input_file
+        )
         image_shape = (image_height, image_width)
 
         polygons = []
@@ -1846,10 +1902,12 @@ class LabelConverter:
             data = self.read_json(label_file)
 
             seg_len += 1
-            if im_widht is None:
-                im_widht = data["imageWidth"]
-            if im_height is None:
-                im_height = data["imageHeight"]
+            if im_widht is None or im_height is None:
+                iw, ih = self._resolve_image_dims(data, label_file)
+                if im_widht is None:
+                    im_widht = iw
+                if im_height is None:
+                    im_height = ih
             if im_ext is None:
                 im_ext = osp.splitext(osp.basename(data["imagePath"]))[-1]
 
@@ -1947,10 +2005,12 @@ class LabelConverter:
             data = self.read_json(label_file)
 
             seg_len += 1
-            if im_widht is None:
-                im_widht = data["imageWidth"]
-            if im_height is None:
-                im_height = data["imageHeight"]
+            if im_widht is None or im_height is None:
+                iw, ih = self._resolve_image_dims(data, label_file)
+                if im_widht is None:
+                    im_widht = iw
+                if im_height is None:
+                    im_height = ih
             if im_ext is None:
                 im_ext = osp.splitext(osp.basename(data["imagePath"]))[-1]
 
@@ -2138,8 +2198,9 @@ class LabelConverter:
         ]
         img = cv2.imdecode(np.fromfile(image_file, dtype=np.uint8), 1)
         data = self.read_json(label_file)
-        image_width = data["imageWidth"]
-        image_height = data["imageHeight"]
+        image_width, image_height = self._resolve_image_dims(
+            data, label_file
+        )
 
         if mode == "rec":
             crop_img_count, rec_gt, annotations = 0, [], []
