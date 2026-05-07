@@ -333,6 +333,19 @@ class LabelConverter:
             width, height = img.size
             return width, height
 
+    def _get_valid_image_dims(self, data, json_file=None, image_file=None):
+        """Return (width, height) from JSON data, falling back to reading the image file when dims are missing or invalid (<= 0)."""
+        w = data.get("imageWidth", -1)
+        h = data.get("imageHeight", -1)
+        if not isinstance(w, int) or not isinstance(h, int) or w <= 0 or h <= 0:
+            if image_file is None and json_file is not None and data.get("imagePath"):
+                image_file = osp.join(
+                    osp.dirname(json_file), osp.basename(data["imagePath"])
+                )
+            if image_file and osp.exists(image_file):
+                w, h = self.get_image_size(image_file)
+        return w, h
+
     @staticmethod
     def get_min_enclosing_bbox(segmentations):
         """
@@ -1206,8 +1219,7 @@ class LabelConverter:
                 pathlib.Path(output_file).touch()
             return is_empty_file
 
-        image_width = data["imageWidth"]
-        image_height = data["imageHeight"]
+        image_width, image_height = self._get_valid_image_dims(data, json_file=input_file)
         image_size = np.array([[image_width, image_height]])
         if mode == "pose":
             pose_data = {}
@@ -1511,8 +1523,7 @@ class LabelConverter:
                     continue
 
             data = self.read_json(label_file)
-            image_width = data["imageWidth"]
-            image_height = data["imageHeight"]
+            image_width, image_height = self._get_valid_image_dims(data, image_file=image_file)
             coco_data["images"].append(
                 {
                     "license": 0,
@@ -1709,7 +1720,7 @@ class LabelConverter:
 
     def custom_to_dota(self, input_file, output_file):
         data = self.read_json(input_file)
-        w, h = data["imageWidth"], data["imageHeight"]
+        w, h = self._get_valid_image_dims(data, json_file=input_file)
         with open(output_file, "w", encoding="utf-8") as f:
             for shape in data["shapes"]:
                 points = shape["points"]
@@ -1737,8 +1748,7 @@ class LabelConverter:
 
     def custom_to_mask(self, input_file, output_file, mapping_table):
         data = self.read_json(input_file)
-        image_width = data["imageWidth"]
-        image_height = data["imageHeight"]
+        image_width, image_height = self._get_valid_image_dims(data, json_file=input_file)
         image_shape = (image_height, image_width)
 
         polygons = []
@@ -1846,10 +1856,12 @@ class LabelConverter:
             data = self.read_json(label_file)
 
             seg_len += 1
-            if im_widht is None:
-                im_widht = data["imageWidth"]
-            if im_height is None:
-                im_height = data["imageHeight"]
+            if im_widht is None or im_height is None:
+                _w, _h = self._get_valid_image_dims(data, json_file=label_file)
+                if im_widht is None:
+                    im_widht = _w
+                if im_height is None:
+                    im_height = _h
             if im_ext is None:
                 im_ext = osp.splitext(osp.basename(data["imagePath"]))[-1]
 
@@ -1947,10 +1959,12 @@ class LabelConverter:
             data = self.read_json(label_file)
 
             seg_len += 1
-            if im_widht is None:
-                im_widht = data["imageWidth"]
-            if im_height is None:
-                im_height = data["imageHeight"]
+            if im_widht is None or im_height is None:
+                _w, _h = self._get_valid_image_dims(data, json_file=label_file)
+                if im_widht is None:
+                    im_widht = _w
+                if im_height is None:
+                    im_height = _h
             if im_ext is None:
                 im_ext = osp.splitext(osp.basename(data["imagePath"]))[-1]
 
@@ -2138,8 +2152,7 @@ class LabelConverter:
         ]
         img = cv2.imdecode(np.fromfile(image_file, dtype=np.uint8), 1)
         data = self.read_json(label_file)
-        image_width = data["imageWidth"]
-        image_height = data["imageHeight"]
+        image_width, image_height = self._get_valid_image_dims(data, image_file=image_file)
 
         if mode == "rec":
             crop_img_count, rec_gt, annotations = 0, [], []
