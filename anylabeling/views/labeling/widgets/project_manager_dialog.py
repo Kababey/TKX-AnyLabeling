@@ -4,6 +4,7 @@ creating, opening, and managing multiple datasets as projects.
 
 import os
 import os.path as osp
+import shutil
 from typing import List, Optional
 
 from PyQt6 import QtCore, QtWidgets
@@ -290,7 +291,53 @@ class ProjectManagerDialog(QDialog):
             4, QHeaderView.ResizeMode.ResizeToContents
         )
         self.table.doubleClicked.connect(self._on_open_selected)
+        self.table.itemSelectionChanged.connect(self._refresh_aug_panel)
         layout.addWidget(self.table, 1)
+
+        # Augmentation datasets section
+        aug_group = QGroupBox(self.tr("Augmentation Datasets (subfolders of selected project)"))
+        aug_layout = QVBoxLayout(aug_group)
+        aug_layout.setContentsMargins(8, 8, 8, 8)
+        aug_layout.setSpacing(6)
+
+        self.aug_table = QTableWidget(0, 3)
+        self.aug_table.setHorizontalHeaderLabels([
+            self.tr("Name"), self.tr("Images"), self.tr("Path"),
+        ])
+        self.aug_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.aug_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.aug_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.aug_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.aug_table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.aug_table.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.Stretch
+        )
+        self.aug_table.setMaximumHeight(140)
+        aug_layout.addWidget(self.aug_table)
+
+        aug_btn_row = QHBoxLayout()
+        self.aug_merge_btn = QPushButton(self.tr("Merge into Project"))
+        self.aug_merge_btn.setStyleSheet(get_ok_btn_style())
+        self.aug_merge_btn.clicked.connect(self._on_aug_merge)
+        self.aug_delete_btn = QPushButton(self.tr("Delete Dataset"))
+        self.aug_delete_btn.setStyleSheet(get_cancel_btn_style())
+        self.aug_delete_btn.clicked.connect(self._on_aug_delete)
+        aug_btn_row.addWidget(self.aug_merge_btn)
+        aug_btn_row.addWidget(self.aug_delete_btn)
+        aug_btn_row.addStretch()
+        aug_layout.addLayout(aug_btn_row)
+
+        layout.addWidget(aug_group)
 
         # Bottom button row
         btn_row = QHBoxLayout()
@@ -348,6 +395,118 @@ class ProjectManagerDialog(QDialog):
 
         if entries:
             self.table.selectRow(0)
+        self._refresh_aug_panel()
+
+    def _refresh_aug_panel(self) -> None:
+        self.aug_table.setRowCount(0)
+        path = self._selected_row_path()
+        if not path or not osp.isdir(path):
+            return
+        for entry in self._find_aug_datasets(path):
+            row = self.aug_table.rowCount()
+            self.aug_table.insertRow(row)
+            self.aug_table.setItem(row, 0, QTableWidgetItem(entry["name"]))
+            self.aug_table.setItem(row, 1, QTableWidgetItem(str(entry["count"])))
+            path_item = QTableWidgetItem(entry["path"])
+            path_item.setData(Qt.ItemDataRole.UserRole, entry["path"])
+            self.aug_table.setItem(row, 2, path_item)
+
+    def _find_aug_datasets(self, project_path: str) -> list:
+        results = []
+        try:
+            for name in sorted(os.listdir(project_path)):
+                sub = osp.join(project_path, name)
+                if not osp.isdir(sub):
+                    continue
+                img_dir = osp.join(sub, "images")
+                lbl_dir = osp.join(sub, "labels")
+                if not osp.isdir(img_dir) or not osp.isdir(lbl_dir):
+                    continue
+                count = sum(
+                    1 for f in os.listdir(img_dir)
+                    if f.lower().endswith((".jpg", ".jpeg", ".png"))
+                )
+                if count == 0:
+                    continue
+                results.append({"name": name, "path": sub, "count": count})
+        except OSError:
+            pass
+        return results
+
+    def _selected_aug_path(self) -> Optional[str]:
+        row = self.aug_table.currentRow()
+        if row < 0:
+            return None
+        item = self.aug_table.item(row, 2)
+        if item is None:
+            return None
+        return item.data(Qt.ItemDataRole.UserRole)
+
+    def _on_aug_merge(self) -> None:
+        aug_path = self._selected_aug_path()
+        if not aug_path:
+            return
+        proj_path = self._selected_row_path()
+        if not proj_path:
+            return
+
+        reply = QMessageBox.question(
+            self,
+            self.tr("Merge augmentation dataset"),
+            self.tr(
+                "Copy all images and labels from:\n%s\n\ninto the project:\n%s\n\n"
+                "Files already present in the project will be skipped."
+            ) % (aug_path, proj_path),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        merged = 0
+        skipped = 0
+        for sub in ("images", "labels"):
+            src_dir = osp.join(aug_path, sub)
+            dst_dir = osp.join(proj_path, sub)
+            if not osp.isdir(src_dir):
+                continue
+            os.makedirs(dst_dir, exist_ok=True)
+            for fname in os.listdir(src_dir):
+                src_file = osp.join(src_dir, fname)
+                dst_file = osp.join(dst_dir, fname)
+                if osp.exists(dst_file):
+                    skipped += 1
+                else:
+                    shutil.copy2(src_file, dst_file)
+                    merged += 1
+
+        QMessageBox.information(
+            self,
+            self.tr("Merge complete"),
+            self.tr("Merged %d files. Skipped %d (already existed).") % (merged, skipped),
+        )
+        self._refresh()
+
+    def _on_aug_delete(self) -> None:
+        aug_path = self._selected_aug_path()
+        if not aug_path:
+            return
+        reply = QMessageBox.question(
+            self,
+            self.tr("Delete augmentation dataset"),
+            self.tr(
+                "Permanently delete this folder and all its contents?\n\n%s\n\n"
+                "This cannot be undone."
+            ) % aug_path,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            shutil.rmtree(aug_path)
+        except OSError as exc:
+            QMessageBox.critical(self, self.tr("Delete failed"), str(exc))
+            return
+        self._refresh_aug_panel()
 
     def _selected_row_path(self) -> Optional[str]:
         row = self.table.currentRow()
