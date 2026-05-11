@@ -1,5 +1,6 @@
-"""Data augmentation dialog – Random Crop and Window Filter tabs."""
+"""Data augmentation dialog – Random Crop, Window Filter, and Mixed Augmentation."""
 
+import copy
 import os
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import numpy as np
 from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QDialog,
     QDoubleSpinBox,
@@ -19,24 +21,31 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
-    QRadioButton,
     QScrollArea,
     QSlider,
     QSpinBox,
     QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
-    QButtonGroup,
+    QHeaderView,
     QSizePolicy,
+    QFrame,
 )
 
 from anylabeling.views.labeling.utils.augmentation_engine import (
+    DEFAULT_PRESETS,
     M1_PRESET,
     M2_PRESET,
     M3_PRESET,
     apply_filter,
     imread_unicode,
+    load_image_filter_config,
+    save_image_filter_config,
+    delete_image_filter_config,
     run_filter_dataset,
+    run_mixed_filter_augmentation,
     run_random_crop,
 )
 from anylabeling.views.labeling.utils.style import (
@@ -74,10 +83,79 @@ class _FilterWorker(QThread):
         self.finished.emit(result)
 
 
+class _MixedAugWorker(QThread):
+    progress = pyqtSignal(int)
+    finished = pyqtSignal(dict)
+
+    def __init__(self, params: dict):
+        super().__init__()
+        self._params = params
+
+    def run(self):
+        result = run_mixed_filter_augmentation(**self._params, progress_callback=self.progress.emit)
+        self.finished.emit(result)
+
+
+# ── Collapsible section widget ─────────────────────────────────────────
+
+class CollapsibleSection(QWidget):
+    """A titled, collapsible section widget."""
+
+    def __init__(self, title: str, collapsed: bool = False, parent=None):
+        super().__init__(parent)
+        self._title = title
+
+        self._toggle_btn = QPushButton()
+        self._toggle_btn.setCheckable(True)
+        self._toggle_btn.setChecked(not collapsed)
+        self._toggle_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._toggle_btn.setStyleSheet(
+            "QPushButton { text-align:left; font-weight:bold; padding:5px 8px; "
+            "border:none; border-radius:3px; background:#2d2d2d; color:#ddd; } "
+            "QPushButton:hover { background:#3d3d3d; }"
+        )
+        self._update_btn_text()
+
+        self._content = QWidget()
+        self._content_layout = QVBoxLayout(self._content)
+        self._content_layout.setContentsMargins(8, 4, 4, 6)
+        self._content_layout.setSpacing(6)
+        self._content.setVisible(not collapsed)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("color: #444;")
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 4, 0, 0)
+        outer.setSpacing(0)
+        outer.addWidget(self._toggle_btn)
+        outer.addWidget(self._content)
+        outer.addWidget(sep)
+
+        self._toggle_btn.toggled.connect(self._on_toggle)
+
+    def _update_btn_text(self):
+        arrow = "▼" if self._toggle_btn.isChecked() else "▶"
+        self._toggle_btn.setText(f"{arrow}  {self._title}")
+
+    def _on_toggle(self, checked: bool):
+        self._content.setVisible(checked)
+        self._update_btn_text()
+
+    def add_widget(self, widget: QWidget):
+        self._content_layout.addWidget(widget)
+
+    def add_layout(self, layout):
+        self._content_layout.addLayout(layout)
+
+    def content_layout(self):
+        return self._content_layout
+
+
 # ── Helpers ────────────────────────────────────────────────────────────
 
 def _labeled_slider(label_text: str, lo: int, hi: int, default: int, step: int = 1):
-    """Return (widget, slider, value_label) for a row with a slider."""
     row = QWidget()
     lay = QHBoxLayout(row)
     lay.setContentsMargins(0, 0, 0, 0)
@@ -113,13 +191,26 @@ def _labeled_dspinbox(label_text: str, lo: float, hi: float, default: float, ste
     return row, spin
 
 
-def _dir_row(label_text: str, placeholder: str = ""):
-    """Return (widget, line_edit, browse_btn) for a directory picker row."""
+def _int_row(label_text: str, lo: int, hi: int, default: int, label_width: int = 175):
     row = QWidget()
     lay = QHBoxLayout(row)
     lay.setContentsMargins(0, 0, 0, 0)
     lbl = QLabel(label_text)
-    lbl.setFixedWidth(100)
+    lbl.setFixedWidth(label_width)
+    spin = QSpinBox()
+    spin.setRange(lo, hi)
+    spin.setValue(default)
+    lay.addWidget(lbl)
+    lay.addWidget(spin)
+    return row, spin
+
+
+def _dir_row(label_text: str, placeholder: str = "", label_width: int = 100):
+    row = QWidget()
+    lay = QHBoxLayout(row)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lbl = QLabel(label_text)
+    lbl.setFixedWidth(label_width)
     edit = QLineEdit()
     if placeholder:
         edit.setPlaceholderText(placeholder)
@@ -130,6 +221,12 @@ def _dir_row(label_text: str, placeholder: str = ""):
     lay.addWidget(edit)
     lay.addWidget(btn)
     return row, edit, btn
+
+
+def _browse_dir(parent, edit: QLineEdit):
+    d = QFileDialog.getExistingDirectory(parent, "Select Directory", edit.text() or "")
+    if d:
+        edit.setText(d)
 
 
 # ── Preview panel ──────────────────────────────────────────────────────
@@ -160,13 +257,16 @@ class _PreviewPanel(QWidget):
             self._labels.append(img_lbl)
 
     def update_images(self, bgr_original: np.ndarray, settings: list, use_clahe: bool):
-        """settings: list of (center, width) for M1/M2/M3; original shown as-is."""
         images = [bgr_original]
         for c, w in settings:
             images.append(apply_filter(bgr_original, c, w, use_clahe))
-
         for label, img in zip(self._labels, images):
             self._set_pixmap(label, img)
+
+    def clear(self):
+        for lbl in self._labels:
+            lbl.clear()
+            lbl.setText("—")
 
     @staticmethod
     def _set_pixmap(label: QLabel, bgr: np.ndarray):
@@ -192,16 +292,21 @@ class _PreviewPanel(QWidget):
 class _RandomCropTab(QWidget):
     def __init__(self, default_dataset_dir: str = "", parent=None):
         super().__init__(parent)
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(10, 10, 10, 10)
-        outer.setSpacing(10)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
 
-        # Parameters
-        params_group = QGroupBox("Augmentation Parameters")
-        pg = QVBoxLayout(params_group)
+        inner = QWidget()
+        outer = QVBoxLayout(inner)
+        outer.setContentsMargins(10, 10, 10, 10)
+        outer.setSpacing(4)
+
+        # Parameters section
+        params_sec = CollapsibleSection("Augmentation Parameters")
+        pg = params_sec.content_layout()
         pg.setSpacing(6)
 
-        self._n_row, self.n_spin, _ = self._int_row("Augmentations per image:", 1, 50, 1)
+        self._n_row, self.n_spin = _int_row("Augmentations per image:", 1, 50, 1)
         pg.addWidget(self._n_row)
 
         self._minr_row, self.min_ratio_spin = _labeled_dspinbox("Min crop ratio:", 0.05, 0.95, 0.30)
@@ -213,35 +318,35 @@ class _RandomCropTab(QWidget):
         self._mmask_row, self.min_mask_spin = _labeled_dspinbox("Min mask ratio:", 0.01, 0.99, 0.10)
         pg.addWidget(self._mmask_row)
 
-        quality_row, self.quality_spin, _ = self._int_row("JPEG quality (0-100):", 1, 100, 100)
+        quality_row, self.quality_spin = _int_row("JPEG quality (0-100):", 1, 100, 100)
         pg.addWidget(quality_row)
 
-        seed_row, self.seed_spin, _ = self._int_row("Random seed:", 0, 999999, 42)
+        seed_row, self.seed_spin = _int_row("Random seed:", 0, 999999, 42)
         pg.addWidget(seed_row)
 
         self.copy_orig_cb = QCheckBox("Copy originals to output")
         self.copy_orig_cb.setChecked(True)
         pg.addWidget(self.copy_orig_cb)
 
-        outer.addWidget(params_group)
+        outer.addWidget(params_sec)
 
-        # I/O
-        io_group = QGroupBox("Directories")
-        ig = QVBoxLayout(io_group)
+        # I/O section
+        io_sec = CollapsibleSection("Input / Output Directories")
+        ig = io_sec.content_layout()
 
         self._ds_row, self.ds_edit, ds_btn = _dir_row("Dataset dir:", "Path to folder with images/ and labels/")
         if default_dataset_dir:
             self.ds_edit.setText(default_dataset_dir)
-        ds_btn.clicked.connect(lambda: self._browse(self.ds_edit))
+        ds_btn.clicked.connect(lambda: _browse_dir(self, self.ds_edit))
         ig.addWidget(self._ds_row)
 
         self._out_row, self.out_edit, out_btn = _dir_row("Output dir:", "Destination folder (will be created)")
-        out_btn.clicked.connect(lambda: self._browse(self.out_edit))
+        out_btn.clicked.connect(lambda: _browse_dir(self, self.out_edit))
         ig.addWidget(self._out_row)
 
-        outer.addWidget(io_group)
+        outer.addWidget(io_sec)
 
-        # Progress
+        # Progress + status
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
@@ -260,27 +365,14 @@ class _RandomCropTab(QWidget):
         outer.addLayout(btn_row)
 
         outer.addStretch()
+
+        scroll.setWidget(inner)
+        top = QVBoxLayout(self)
+        top.setContentsMargins(0, 0, 0, 0)
+        top.addWidget(scroll)
+
         self.run_btn.clicked.connect(self._run)
         self._worker = None
-
-    @staticmethod
-    def _int_row(label_text: str, lo: int, hi: int, default: int):
-        row = QWidget()
-        lay = QHBoxLayout(row)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lbl = QLabel(label_text)
-        lbl.setFixedWidth(175)
-        spin = QSpinBox()
-        spin.setRange(lo, hi)
-        spin.setValue(default)
-        lay.addWidget(lbl)
-        lay.addWidget(spin)
-        return row, spin, lbl
-
-    def _browse(self, edit: QLineEdit):
-        d = QFileDialog.getExistingDirectory(self, "Select Directory", edit.text() or "")
-        if d:
-            edit.setText(d)
 
     def _run(self):
         ds = self.ds_edit.text().strip()
@@ -321,11 +413,13 @@ class _RandomCropTab(QWidget):
             self.status_label.setText(f"Error: {result['error']}")
             QMessageBox.critical(self, "Augmentation Error", result["error"])
         else:
+            backend = result.get("backend", "opencv")
             msg = (
                 f"Done! Originals: {result['originals']} | "
                 f"Augmented: {result['augmented']} | "
                 f"Total: {result['total']}\n"
-                f"Output: {result['output_dir']}"
+                f"Output: {result['output_dir']}\n"
+                f"Backend: {backend}"
             )
             self.status_label.setText(msg)
             QMessageBox.information(self, "Complete", msg)
@@ -340,52 +434,52 @@ class _FilterTab(QWidget):
         self._bgr_image = None
         self._worker = None
 
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(10, 10, 10, 10)
-        outer.setSpacing(10)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
 
-        # --- Preview section ---
-        preview_group = QGroupBox("Preview (current image)")
-        prev_lay = QVBoxLayout(preview_group)
+        inner = QWidget()
+        outer = QVBoxLayout(inner)
+        outer.setContentsMargins(10, 10, 10, 10)
+        outer.setSpacing(4)
+
+        # ── Section 1: Preview ────────────────────────────────────────
+        preview_sec = CollapsibleSection("Preview (current image)")
+        pv = preview_sec.content_layout()
 
         self._preview = _PreviewPanel()
-        scroll = QScrollArea()
-        scroll.setWidget(self._preview)
-        scroll.setWidgetResizable(True)
-        scroll.setMinimumHeight(450)
-        prev_lay.addWidget(scroll)
+        pv.addWidget(self._preview)
 
         load_row = QHBoxLayout()
+        load_row.addWidget(QLabel("Image:"))
         self._img_path_edit = QLineEdit(current_image_path)
         self._img_path_edit.setPlaceholderText("Image path for preview…")
+        load_row.addWidget(self._img_path_edit)
         load_btn = QPushButton("Load")
-        load_btn.setFixedWidth(65)
+        load_btn.setFixedWidth(55)
         load_btn.setStyleSheet(get_cancel_btn_style())
         load_btn.clicked.connect(self._load_preview_image)
-        load_row.addWidget(QLabel("Image:"))
-        load_row.addWidget(self._img_path_edit)
         load_row.addWidget(load_btn)
         browse_img_btn = QPushButton("Browse…")
         browse_img_btn.setFixedWidth(75)
         browse_img_btn.setStyleSheet(get_cancel_btn_style())
         browse_img_btn.clicked.connect(self._browse_image)
         load_row.addWidget(browse_img_btn)
-        prev_lay.addLayout(load_row)
+        pv.addLayout(load_row)
 
-        outer.addWidget(preview_group)
+        outer.addWidget(preview_sec)
 
-        # --- Filter settings ---
-        settings_group = QGroupBox("Filter Settings")
-        sg = QVBoxLayout(settings_group)
+        # ── Section 2: Filter Settings ────────────────────────────────
+        settings_sec = CollapsibleSection("Filter Settings")
+        sg = settings_sec.content_layout()
         sg.setSpacing(6)
 
         self._clahe_cb = QCheckBox("Apply CLAHE on top of window filter")
         self._clahe_cb.toggled.connect(self._refresh_preview)
         sg.addWidget(self._clahe_cb)
 
-        # M1/M2/M3 preset buttons row
         preset_row = QHBoxLayout()
-        preset_row.addWidget(QLabel("Presets:"))
+        preset_row.addWidget(QLabel("Quick presets:"))
         for name, (c, w) in [("M1", M1_PRESET), ("M2", M2_PRESET), ("M3", M3_PRESET)]:
             btn = QPushButton(f"{name}  (C={c}, W={w})")
             btn.setStyleSheet(get_cancel_btn_style())
@@ -394,9 +488,9 @@ class _FilterTab(QWidget):
         preset_row.addStretch()
         sg.addLayout(preset_row)
 
-        # Preset editor
-        preset_edit_group = QGroupBox("Customize Presets (used in preview & dataset ops)")
-        peg = QtWidgets.QGridLayout(preset_edit_group)
+        # Preset editor (M1 / M2 / M3 spinboxes)
+        preset_edit_grp = QGroupBox("Customize Presets (used in preview & dataset ops)")
+        peg = QtWidgets.QGridLayout(preset_edit_grp)
         peg.setSpacing(6)
         preset_data = [("M1", M1_PRESET), ("M2", M2_PRESET), ("M3", M3_PRESET)]
         self._preset_c_spins = {}
@@ -417,42 +511,85 @@ class _FilterTab(QWidget):
             peg.addWidget(w_spin, 2, col * 3 + 1)
             self._preset_c_spins[name] = c_spin
             self._preset_w_spins[name] = w_spin
+        sg.addWidget(preset_edit_grp)
+        outer.addWidget(settings_sec)
 
-        sg.addWidget(preset_edit_group)
-        outer.addWidget(settings_group)
+        # ── Section 3: Per-Image Config ───────────────────────────────
+        img_cfg_sec = CollapsibleSection("Per-Image Filter Config", collapsed=True)
+        ic = img_cfg_sec.content_layout()
+        ic.setSpacing(6)
 
-        # --- Dataset operation ---
-        ds_group = QGroupBox("Apply to Dataset")
-        dg = QVBoxLayout(ds_group)
+        ic.addWidget(QLabel(
+            "Save/load filter settings specifically for the current previewed image.\n"
+            "These configs can be used to track intended windowing per image."
+        ))
+
+        # Active single-image filter controls
+        single_row_c, self._single_c_spin = _int_row("Center:", 0, 255, 128, 80)
+        single_row_w, self._single_w_spin = _int_row("Width:", 1, 510, 110, 80)
+        self._single_clahe_cb = QCheckBox("CLAHE")
+        ic.addWidget(single_row_c)
+        ic.addWidget(single_row_w)
+        ic.addWidget(self._single_clahe_cb)
+
+        ic_btn_row = QHBoxLayout()
+        save_cfg_btn = QPushButton("Save Config for This Image")
+        save_cfg_btn.setStyleSheet(get_ok_btn_style())
+        save_cfg_btn.clicked.connect(self._save_img_filter_config)
+        load_cfg_btn = QPushButton("Load Saved Config")
+        load_cfg_btn.setStyleSheet(get_cancel_btn_style())
+        load_cfg_btn.clicked.connect(self._load_img_filter_config)
+        del_cfg_btn = QPushButton("Delete Config")
+        del_cfg_btn.setStyleSheet(get_cancel_btn_style())
+        del_cfg_btn.clicked.connect(self._delete_img_filter_config)
+        apply_single_btn = QPushButton("Preview with This Config")
+        apply_single_btn.setStyleSheet(get_cancel_btn_style())
+        apply_single_btn.clicked.connect(self._apply_single_config_to_preview)
+        ic_btn_row.addWidget(save_cfg_btn)
+        ic_btn_row.addWidget(load_cfg_btn)
+        ic_btn_row.addWidget(del_cfg_btn)
+        ic_btn_row.addWidget(apply_single_btn)
+        ic.addLayout(ic_btn_row)
+
+        self._cfg_status_lbl = QLabel("")
+        self._cfg_status_lbl.setWordWrap(True)
+        ic.addWidget(self._cfg_status_lbl)
+
+        outer.addWidget(img_cfg_sec)
+
+        # ── Section 4: Batch Dataset Operations ───────────────────────
+        batch_sec = CollapsibleSection("Apply Filter to Dataset")
+        dg = batch_sec.content_layout()
         dg.setSpacing(6)
 
         self._ds2_row, self.ds2_edit, ds2_btn = _dir_row("Dataset dir:", "Path with images/ and labels/")
         if default_dataset_dir:
             self.ds2_edit.setText(default_dataset_dir)
-        ds2_btn.clicked.connect(lambda: self._browse_dir(self.ds2_edit))
+        ds2_btn.clicked.connect(lambda: _browse_dir(self, self.ds2_edit))
         dg.addWidget(self._ds2_row)
 
-        self._out2_row, self.out2_edit, out2_btn = _dir_row("Output dir:", "Leave empty to use dataset_dir + '_filtered'")
-        out2_btn.clicked.connect(lambda: self._browse_dir(self.out2_edit))
+        self._out2_row, self.out2_edit, out2_btn = _dir_row("Output dir:", "Leave empty → dataset_filtered")
+        out2_btn.clicked.connect(lambda: _browse_dir(self, self.out2_edit))
         dg.addWidget(self._out2_row)
 
-        self.copy_orig2_cb = QCheckBox("Copy originals to output")
+        opts_row = QHBoxLayout()
+        self.copy_orig2_cb = QCheckBox("Copy originals")
         self.copy_orig2_cb.setChecked(True)
-        dg.addWidget(self.copy_orig2_cb)
+        opts_row.addWidget(self.copy_orig2_cb)
+        quality_row2, self.quality2_spin = _int_row("JPEG quality:", 1, 100, 100, 90)
+        opts_row.addWidget(quality_row2)
+        opts_row.addStretch()
+        dg.addLayout(opts_row)
 
-        quality_row2, self.quality2_spin, _ = _RandomCropTab._int_row("JPEG quality:", 1, 100, 100)
-        dg.addWidget(quality_row2)
-
-        # Mode: which preset(s) to apply
-        mode_group = QGroupBox("Which filter to apply")
-        mg = QVBoxLayout(mode_group)
+        mode_grp = QGroupBox("Which filter to apply")
+        mg = QVBoxLayout(mode_grp)
         self._mode_m1 = QCheckBox("M1")
         self._mode_m2 = QCheckBox("M2")
         self._mode_m3 = QCheckBox("M3")
         self._mode_m2.setChecked(True)
         for cb in (self._mode_m1, self._mode_m2, self._mode_m3):
             mg.addWidget(cb)
-        dg.addWidget(mode_group)
+        dg.addWidget(mode_grp)
 
         apply_btns = QHBoxLayout()
         apply_btns.addStretch()
@@ -462,17 +599,19 @@ class _FilterTab(QWidget):
         apply_btns.addWidget(self.apply_btn)
         dg.addLayout(apply_btns)
 
-        # Random filter augmentation sub-section
-        rand_group = QGroupBox("Random Filter Augmentation")
-        rg = QVBoxLayout(rand_group)
-        rg.setSpacing(4)
-        rg.addWidget(QLabel("Randomize center and width per image within ranges:"))
+        outer.addWidget(batch_sec)
 
-        self._rc_min_row, self.rc_min_spin, _ = _RandomCropTab._int_row("Center min:", 0, 255, 90)
-        self._rc_max_row, self.rc_max_spin, _ = _RandomCropTab._int_row("Center max:", 0, 255, 165)
-        self._rw_min_row, self.rw_min_spin, _ = _RandomCropTab._int_row("Width min:", 1, 510, 50)
-        self._rw_max_row, self.rw_max_spin, _ = _RandomCropTab._int_row("Width max:", 1, 510, 200)
-        seed_row_r, self.seed2_spin, _ = _RandomCropTab._int_row("Seed:", 0, 999999, 42)
+        # ── Section 5: Random Filter Augmentation ─────────────────────
+        rand_sec = CollapsibleSection("Random Filter Augmentation (range-based)", collapsed=True)
+        rg = rand_sec.content_layout()
+        rg.setSpacing(4)
+        rg.addWidget(QLabel("Assign a random center and width per image within the ranges below:"))
+
+        self._rc_min_row, self.rc_min_spin = _int_row("Center min:", 0, 255, 90)
+        self._rc_max_row, self.rc_max_spin = _int_row("Center max:", 0, 255, 165)
+        self._rw_min_row, self.rw_min_spin = _int_row("Width min:", 1, 510, 50)
+        self._rw_max_row, self.rw_max_spin = _int_row("Width max:", 1, 510, 200)
+        seed_row_r, self.seed2_spin = _int_row("Seed:", 0, 999999, 42)
         for w in (self._rc_min_row, self._rc_max_row, self._rw_min_row, self._rw_max_row, seed_row_r):
             rg.addWidget(w)
 
@@ -484,9 +623,98 @@ class _FilterTab(QWidget):
         rand_btns.addWidget(self.rand_btn)
         rg.addLayout(rand_btns)
 
-        dg.addWidget(rand_group)
-        outer.addWidget(ds_group)
+        outer.addWidget(rand_sec)
 
+        # ── Section 6: Mixed Preset Augmentation ──────────────────────
+        mixed_sec = CollapsibleSection("Mixed Preset Augmentation", collapsed=False)
+        mx = mixed_sec.content_layout()
+        mx.setSpacing(6)
+
+        mx.addWidget(QLabel(
+            "Select a fraction of images from the dataset and apply a mix of named\n"
+            "window presets according to the ratios below. CLAHE is applied randomly."
+        ))
+
+        frac_row, self.mix_frac_spin = _labeled_dspinbox(
+            "Augmentation fraction:", 0.01, 1.0, 0.20, 0.01
+        )
+        mx.addWidget(frac_row)
+
+        clahe_row, self.mix_clahe_spin = _labeled_dspinbox(
+            "CLAHE probability:", 0.0, 1.0, 0.50, 0.05
+        )
+        mx.addWidget(clahe_row)
+
+        mix_seed_row, self.mix_seed_spin = _int_row("Seed:", 0, 999999, 42)
+        mx.addWidget(mix_seed_row)
+
+        mix_copy_row = QHBoxLayout()
+        self.mix_copy_orig_cb = QCheckBox("Copy originals to output")
+        self.mix_copy_orig_cb.setChecked(True)
+        self.mix_merge_cb = QCheckBox("Merge augmented images into source dataset")
+        self.mix_merge_cb.setToolTip(
+            "When checked, augmented images are written directly into the source\n"
+            "dataset's images/ and labels/ folders (output dir is ignored)."
+        )
+        self.mix_merge_cb.toggled.connect(self._on_merge_toggle)
+        mix_copy_row.addWidget(self.mix_copy_orig_cb)
+        mix_copy_row.addWidget(self.mix_merge_cb)
+        mix_copy_row.addStretch()
+        mx.addLayout(mix_copy_row)
+
+        # Preset table
+        mx.addWidget(QLabel("Preset mix (each row: name, center, width, ratio):"))
+        self.mix_table = QTableWidget(0, 4)
+        self.mix_table.setHorizontalHeaderLabels(["Name", "Center", "Width", "Ratio"])
+        self.mix_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.mix_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.mix_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.mix_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.mix_table.setMaximumHeight(140)
+        self.mix_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        mx.addWidget(self.mix_table)
+
+        table_btn_row = QHBoxLayout()
+        add_preset_btn = QPushButton("+ Add Preset")
+        add_preset_btn.setStyleSheet(get_cancel_btn_style())
+        add_preset_btn.clicked.connect(self._add_mix_preset_row)
+        remove_preset_btn = QPushButton("Remove Selected")
+        remove_preset_btn.setStyleSheet(get_cancel_btn_style())
+        remove_preset_btn.clicked.connect(self._remove_mix_preset_row)
+        reset_preset_btn = QPushButton("Reset to Defaults")
+        reset_preset_btn.setStyleSheet(get_cancel_btn_style())
+        reset_preset_btn.clicked.connect(self._reset_mix_presets)
+        table_btn_row.addWidget(add_preset_btn)
+        table_btn_row.addWidget(remove_preset_btn)
+        table_btn_row.addWidget(reset_preset_btn)
+        table_btn_row.addStretch()
+        mx.addLayout(table_btn_row)
+
+        # I/O for mixed aug
+        self._mix_ds_row, self.mix_ds_edit, mix_ds_btn = _dir_row("Dataset dir:", "Source dataset with images/ and labels/")
+        if default_dataset_dir:
+            self.mix_ds_edit.setText(default_dataset_dir)
+        mix_ds_btn.clicked.connect(lambda: _browse_dir(self, self.mix_ds_edit))
+        mx.addWidget(self._mix_ds_row)
+
+        self._mix_out_row, self.mix_out_edit, mix_out_btn = _dir_row("Output dir:", "Destination (ignored if merge checked)")
+        mix_out_btn.clicked.connect(lambda: _browse_dir(self, self.mix_out_edit))
+        mx.addWidget(self._mix_out_row)
+
+        mix_quality_row, self.mix_quality_spin = _int_row("JPEG quality:", 1, 100, 100)
+        mx.addWidget(mix_quality_row)
+
+        mix_run_row = QHBoxLayout()
+        mix_run_row.addStretch()
+        self.mix_run_btn = QPushButton("Run Mixed Augmentation")
+        self.mix_run_btn.setStyleSheet(get_ok_btn_style())
+        self.mix_run_btn.clicked.connect(self._run_mixed)
+        mix_run_row.addWidget(self.mix_run_btn)
+        mx.addLayout(mix_run_row)
+
+        outer.addWidget(mixed_sec)
+
+        # Shared progress / status
         self.progress_bar2 = QProgressBar()
         self.progress_bar2.setRange(0, 100)
         self.progress_bar2.hide()
@@ -498,11 +726,19 @@ class _FilterTab(QWidget):
 
         outer.addStretch()
 
+        scroll.setWidget(inner)
+        top = QVBoxLayout(self)
+        top.setContentsMargins(0, 0, 0, 0)
+        top.addWidget(scroll)
+
+        # Populate default mix presets
+        self._reset_mix_presets()
+
         # Load current image on init
         if current_image_path and Path(current_image_path).exists():
             self._load_image(current_image_path)
 
-    # -- preview helpers --
+    # ── preview helpers ──────────────────────────────────────────────
 
     def _browse_image(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -512,11 +748,6 @@ class _FilterTab(QWidget):
         if path:
             self._img_path_edit.setText(path)
             self._load_image(path)
-
-    def _browse_dir(self, edit: QLineEdit):
-        d = QFileDialog.getExistingDirectory(self, "Select Directory", edit.text() or "")
-        if d:
-            edit.setText(d)
 
     def _load_preview_image(self):
         path = self._img_path_edit.text().strip()
@@ -528,10 +759,23 @@ class _FilterTab(QWidget):
         if img is None:
             return
         self._bgr_image = img
+        self._current_image_path = path
+        self._img_path_edit.setText(path)
         self._refresh_preview()
+        # Also auto-load saved config if present
+        self._maybe_show_saved_config_hint(path)
+
+    def _maybe_show_saved_config_hint(self, path: str):
+        cfg = load_image_filter_config(path)
+        if cfg:
+            self._cfg_status_lbl.setText(
+                f"Saved config for this image: C={cfg.get('center','?')}  "
+                f"W={cfg.get('width','?')}  CLAHE={cfg.get('clahe', False)}"
+            )
+        else:
+            self._cfg_status_lbl.setText("")
 
     def _apply_preset(self, center: int, width: int):
-        """Set the M2 spinboxes to the clicked preset values and refresh."""
         self._preset_c_spins["M2"].setValue(center)
         self._preset_w_spins["M2"].setValue(width)
         self._mode_m2.setChecked(True)
@@ -547,7 +791,70 @@ class _FilterTab(QWidget):
         ]
         self._preview.update_images(self._bgr_image, settings, self._clahe_cb.isChecked())
 
-    # -- dataset operations --
+    def update_current_image(self, image_path: str):
+        """Called by parent when the user opens a new image in the main window."""
+        if image_path and Path(image_path).exists():
+            self._load_image(image_path)
+
+    # ── per-image filter config ──────────────────────────────────────
+
+    def _save_img_filter_config(self):
+        path = self._current_image_path
+        if not path or not Path(path).exists():
+            QMessageBox.warning(self, "No Image", "Load an image first.")
+            return
+        config = {
+            "center": self._single_c_spin.value(),
+            "width": self._single_w_spin.value(),
+            "clahe": self._single_clahe_cb.isChecked(),
+        }
+        save_image_filter_config(path, config)
+        self._cfg_status_lbl.setText(
+            f"Saved: C={config['center']}  W={config['width']}  CLAHE={config['clahe']}"
+        )
+
+    def _load_img_filter_config(self):
+        path = self._current_image_path
+        if not path or not Path(path).exists():
+            QMessageBox.warning(self, "No Image", "Load an image first.")
+            return
+        cfg = load_image_filter_config(path)
+        if not cfg:
+            QMessageBox.information(self, "No Config", "No saved filter config found for this image.")
+            return
+        self._single_c_spin.setValue(cfg.get("center", 128))
+        self._single_w_spin.setValue(cfg.get("width", 110))
+        self._single_clahe_cb.setChecked(cfg.get("clahe", False))
+        self._cfg_status_lbl.setText(
+            f"Loaded: C={cfg.get('center','?')}  W={cfg.get('width','?')}  CLAHE={cfg.get('clahe', False)}"
+        )
+
+    def _delete_img_filter_config(self):
+        path = self._current_image_path
+        if not path:
+            return
+        delete_image_filter_config(path)
+        self._cfg_status_lbl.setText("Config deleted.")
+
+    def _apply_single_config_to_preview(self):
+        if self._bgr_image is None:
+            return
+        c = self._single_c_spin.value()
+        w = self._single_w_spin.value()
+        use_clahe = self._single_clahe_cb.isChecked()
+        # Temporarily override M2 values for preview
+        self._preset_c_spins["M2"].blockSignals(True)
+        self._preset_w_spins["M2"].blockSignals(True)
+        self._preset_c_spins["M2"].setValue(c)
+        self._preset_w_spins["M2"].setValue(w)
+        self._preset_c_spins["M2"].blockSignals(False)
+        self._preset_w_spins["M2"].blockSignals(False)
+        self._clahe_cb.blockSignals(True)
+        self._clahe_cb.setChecked(use_clahe)
+        self._clahe_cb.blockSignals(False)
+        self._refresh_preview()
+
+    # ── dataset filter ops ───────────────────────────────────────────
 
     def _get_presets_to_apply(self):
         presets = []
@@ -573,13 +880,12 @@ class _FilterTab(QWidget):
         if not out:
             out = str(Path(ds).parent / (Path(ds).name + "_filtered"))
 
-        # Run each selected preset sequentially (use same output dir for all)
         self.apply_btn.setEnabled(False)
         self.rand_btn.setEnabled(False)
+        self.mix_run_btn.setEnabled(False)
         self.progress_bar2.show()
         self.status2_label.setText("Running…")
 
-        # Build params for the first preset; chain results via signals
         self._pending_presets = list(presets)
         self._multi_preset_run = len(presets) > 1
         self._filter_out_base = out
@@ -590,14 +896,12 @@ class _FilterTab(QWidget):
 
     def _run_next_preset(self):
         if not self._pending_presets:
-            self.apply_btn.setEnabled(True)
-            self.rand_btn.setEnabled(True)
+            self._enable_buttons()
             self.progress_bar2.hide()
             QMessageBox.information(self, "Complete", self.status2_label.text())
             return
 
         name, c, w = self._pending_presets.pop(0)
-        # Use per-name subfolders when multiple presets are selected
         if self._multi_preset_run:
             out_dir = str(Path(self._filter_out_base) / name)
         else:
@@ -620,8 +924,7 @@ class _FilterTab(QWidget):
 
     def _on_filter_done(self, result: dict):
         if "error" in result:
-            self.apply_btn.setEnabled(True)
-            self.rand_btn.setEnabled(True)
+            self._enable_buttons()
             self.progress_bar2.hide()
             self.status2_label.setText(f"Error: {result['error']}")
             QMessageBox.critical(self, "Error", result["error"])
@@ -672,6 +975,7 @@ class _FilterTab(QWidget):
 
         self.apply_btn.setEnabled(False)
         self.rand_btn.setEnabled(False)
+        self.mix_run_btn.setEnabled(False)
         self.progress_bar2.show()
         self.status2_label.setText("Running random filter…")
 
@@ -681,8 +985,7 @@ class _FilterTab(QWidget):
         self._worker.start()
 
     def _on_rand_done(self, result: dict):
-        self.apply_btn.setEnabled(True)
-        self.rand_btn.setEnabled(True)
+        self._enable_buttons()
         self.progress_bar2.hide()
         if "error" in result:
             self.status2_label.setText(f"Error: {result['error']}")
@@ -697,12 +1000,120 @@ class _FilterTab(QWidget):
             self.status2_label.setText(msg)
             QMessageBox.information(self, "Complete", msg)
 
-    def update_current_image(self, image_path: str):
-        """Called by parent when the user opens a new image."""
-        self._img_path_edit.setText(image_path)
-        self._current_image_path = image_path
-        if image_path and Path(image_path).exists():
-            self._load_image(image_path)
+    # ── mixed augmentation ───────────────────────────────────────────
+
+    def _on_merge_toggle(self, checked: bool):
+        self.mix_out_edit.setEnabled(not checked)
+        self.mix_copy_orig_cb.setEnabled(not checked)
+
+    def _add_mix_preset_row(self, name="", center=128, width=110, ratio=0.5):
+        row = self.mix_table.rowCount()
+        self.mix_table.insertRow(row)
+        self.mix_table.setItem(row, 0, QTableWidgetItem(str(name)))
+        c_spin = QSpinBox()
+        c_spin.setRange(0, 255)
+        c_spin.setValue(int(center))
+        self.mix_table.setCellWidget(row, 1, c_spin)
+        w_spin = QSpinBox()
+        w_spin.setRange(1, 510)
+        w_spin.setValue(int(width))
+        self.mix_table.setCellWidget(row, 2, w_spin)
+        r_spin = QDoubleSpinBox()
+        r_spin.setRange(0.01, 10.0)
+        r_spin.setSingleStep(0.05)
+        r_spin.setDecimals(2)
+        r_spin.setValue(float(ratio))
+        self.mix_table.setCellWidget(row, 3, r_spin)
+
+    def _remove_mix_preset_row(self):
+        row = self.mix_table.currentRow()
+        if row >= 0:
+            self.mix_table.removeRow(row)
+
+    def _reset_mix_presets(self):
+        self.mix_table.setRowCount(0)
+        self._add_mix_preset_row("M2", M2_PRESET[0], M2_PRESET[1], 0.5)
+        self._add_mix_preset_row("M3", M3_PRESET[0], M3_PRESET[1], 0.5)
+
+    def _collect_mix_presets(self):
+        presets = []
+        for row in range(self.mix_table.rowCount()):
+            name_item = self.mix_table.item(row, 0)
+            name = name_item.text().strip() if name_item else f"P{row}"
+            c_spin = self.mix_table.cellWidget(row, 1)
+            w_spin = self.mix_table.cellWidget(row, 2)
+            r_spin = self.mix_table.cellWidget(row, 3)
+            presets.append({
+                "name": name or f"P{row}",
+                "center": c_spin.value() if c_spin else 128,
+                "width": w_spin.value() if w_spin else 110,
+                "ratio": r_spin.value() if r_spin else 1.0,
+            })
+        return presets
+
+    def _run_mixed(self):
+        ds = self.mix_ds_edit.text().strip()
+        if not ds:
+            QMessageBox.warning(self, "Missing Path", "Set a dataset directory.")
+            return
+        if not Path(ds, "images").exists():
+            QMessageBox.warning(self, "Invalid Dataset", f"No 'images' subfolder in:\n{ds}")
+            return
+
+        presets = self._collect_mix_presets()
+        if not presets:
+            QMessageBox.warning(self, "No Presets", "Add at least one preset row.")
+            return
+
+        merge = self.mix_merge_cb.isChecked()
+        out = self.mix_out_edit.text().strip()
+        if not merge and not out:
+            out = str(Path(ds).parent / (Path(ds).name + "_mixed_aug"))
+
+        params = {
+            "dataset_dir": ds,
+            "output_dir": out if not merge else ds,
+            "augmentation_fraction": self.mix_frac_spin.value(),
+            "presets": presets,
+            "clahe_probability": self.mix_clahe_spin.value(),
+            "copy_originals": self.mix_copy_orig_cb.isChecked() and not merge,
+            "merge_into_source": merge,
+            "output_jpeg_quality": self.mix_quality_spin.value(),
+            "seed": self.mix_seed_spin.value(),
+        }
+
+        self.apply_btn.setEnabled(False)
+        self.rand_btn.setEnabled(False)
+        self.mix_run_btn.setEnabled(False)
+        self.progress_bar2.setValue(0)
+        self.progress_bar2.show()
+        self.status2_label.setText("Running mixed augmentation…")
+
+        self._worker = _MixedAugWorker(params)
+        self._worker.progress.connect(self.progress_bar2.setValue)
+        self._worker.finished.connect(self._on_mixed_done)
+        self._worker.start()
+
+    def _on_mixed_done(self, result: dict):
+        self._enable_buttons()
+        self.progress_bar2.hide()
+        if "error" in result:
+            self.status2_label.setText(f"Error: {result['error']}")
+            QMessageBox.critical(self, "Error", result["error"])
+        else:
+            msg = (
+                f"Done! Originals copied: {result['originals']} | "
+                f"Augmented: {result['augmented']} | "
+                f"Total: {result['total']}\n"
+                f"Output: {result['output_dir']}"
+            )
+            self.status2_label.setText(msg)
+            QMessageBox.information(self, "Complete", msg)
+
+    def _enable_buttons(self):
+        self.apply_btn.setEnabled(True)
+        self.rand_btn.setEnabled(True)
+        self.mix_run_btn.setEnabled(True)
 
 
 # ── Main dialog ────────────────────────────────────────────────────────
@@ -713,7 +1124,7 @@ class AugmentationDialog(QDialog):
     def __init__(self, current_image_path: str = "", dataset_dir: str = "", parent=None):
         super().__init__(parent)
         self.setWindowTitle("Data Augmentation")
-        self.setMinimumSize(700, 680)
+        self.setMinimumSize(750, 700)
         self.setWindowFlags(
             self.windowFlags() & ~Qt.WindowType.WindowContextHelpButtonHint
         )
@@ -750,3 +1161,4 @@ class AugmentationDialog(QDialog):
         if directory:
             self._crop_tab.ds_edit.setText(directory)
             self._filter_tab.ds2_edit.setText(directory)
+            self._filter_tab.mix_ds_edit.setText(directory)

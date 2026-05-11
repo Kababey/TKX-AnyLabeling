@@ -5349,6 +5349,15 @@ class LabelingWidget(LabelDialog):
         if self.compare_view_manager.is_active():
             self.compare_view_manager.load_compare_for_file(self.filename)
 
+        # Keep augmentation preview in sync when dialog is open
+        if (
+            hasattr(self, "_augmentation_dialog")
+            and self._augmentation_dialog is not None
+            and self._augmentation_dialog.isVisible()
+            and self.image_path
+        ):
+            self._augmentation_dialog.update_current_image(self.image_path)
+
         return True
 
     # QT Overload
@@ -6304,7 +6313,16 @@ class LabelingWidget(LabelDialog):
         """Open the project manager home screen."""
         dialog = ProjectManagerDialog(self.project_manager, parent=self)
         dialog.project_opened.connect(self._on_project_opened)
+        dialog.open_augmentation_for.connect(self._on_open_augmentation_for_dataset)
         dialog.exec()
+
+    def _on_open_augmentation_for_dataset(self, dataset_path: str):
+        """Open the augmentation dialog pre-filled with the given dataset path."""
+        self.open_augmentation_dialog()
+        if hasattr(self, "_augmentation_dialog") and self._augmentation_dialog:
+            self._augmentation_dialog.set_dataset_dir(dataset_path)
+            self._augmentation_dialog.show()
+            self._augmentation_dialog.raise_()
 
     def open_augmentation_dialog(self):
         """Open the data augmentation dialog (random crop + window filter)."""

@@ -1,5 +1,6 @@
-"""Backend logic for data augmentation: random crop and window filter."""
+"""Backend logic for data augmentation: random crop, window filter, mixed augmentation."""
 
+import json
 import shutil
 from pathlib import Path
 
@@ -10,6 +11,12 @@ import numpy as np
 M1_PRESET = (128, 50)   # Narrow/high-contrast – fine defects
 M2_PRESET = (128, 110)  # Standard inspection
 M3_PRESET = (128, 200)  # Wide range – broad features
+
+DEFAULT_PRESETS = {
+    "M1": M1_PRESET,
+    "M2": M2_PRESET,
+    "M3": M3_PRESET,
+}
 
 
 # ── Image I/O ─────────────────────────────────────────────────────────
@@ -61,6 +68,35 @@ def apply_filter(image: np.ndarray, center: int, width: int,
     return result
 
 
+# ── Per-image filter config sidecar ───────────────────────────────────
+
+def _sidecar_path(image_path: Path) -> Path:
+    return image_path.with_suffix(".filter.json")
+
+
+def save_image_filter_config(image_path: str, config: dict) -> None:
+    """Save per-image filter config as a JSON sidecar next to the image."""
+    p = _sidecar_path(Path(image_path))
+    p.write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+
+def load_image_filter_config(image_path: str) -> dict:
+    """Load per-image filter config, or {} if none exists."""
+    p = _sidecar_path(Path(image_path))
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def delete_image_filter_config(image_path: str) -> None:
+    p = _sidecar_path(Path(image_path))
+    if p.exists():
+        p.unlink()
+
+
 # ── YOLO segmentation I/O ─────────────────────────────────────────────
 
 def read_yolo_seg(label_path: Path):
@@ -106,15 +142,27 @@ def mask_to_poly(mask: np.ndarray):
     return [(float(p[0][0]) / w, float(p[0][1]) / h) for p in contour]
 
 
-# ── Random crop augmentation ──────────────────────────────────────────
+# ── Random crop (OpenCV native, no albumentations) ────────────────────
 
-def _crop_transform(img_h, img_w, crop_min, crop_max):
-    try:
-        import albumentations as A
-    except ImportError:
-        raise ImportError(
-            "albumentations is required. Install with: pip install albumentations"
-        )
+def _run_crop_opencv(img_rgb: np.ndarray, masks: list, crop_min: float, crop_max: float):
+    """Random crop without albumentations dependency."""
+    h, w = img_rgb.shape[:2]
+    min_h = max(1, int(h * crop_min))
+    max_h = max(min_h, int(h * crop_max))
+    min_w = max(1, int(w * crop_min))
+    max_w = max(min_w, int(w * crop_max))
+    crop_h = int(np.random.randint(min_h, max_h + 1))
+    crop_w = int(np.random.randint(min_w, max_w + 1))
+    y1 = int(np.random.randint(0, max(1, h - crop_h + 1)))
+    x1 = int(np.random.randint(0, max(1, w - crop_w + 1)))
+    y2, x2 = y1 + crop_h, x1 + crop_w
+    cropped_img = img_rgb[y1:y2, x1:x2]
+    cropped_masks = [m[y1:y2, x1:x2] for m in masks]
+    return cropped_img, cropped_masks
+
+
+def _crop_transform_albumentations(img_h, img_w, crop_min, crop_max):
+    import albumentations as A
     min_h = max(1, int(img_h * crop_min))
     max_h = max(min_h, int(img_h * crop_max))
     min_w = max(1, int(img_w * crop_min))
@@ -145,12 +193,15 @@ def run_random_crop(
 ) -> dict:
     """Run random-crop augmentation on a YOLO-seg dataset folder.
 
+    Uses albumentations if available; falls back to pure OpenCV otherwise.
     Returns a result dict with keys: originals, augmented, total, output_dir, error.
     """
+    _use_albumentations = False
     try:
-        import albumentations  # noqa – just probe availability
+        import albumentations  # noqa
+        _use_albumentations = True
     except ImportError:
-        return {"error": "albumentations not installed. Run: pip install albumentations"}
+        pass  # use pure OpenCV fallback
 
     np.random.seed(seed)
 
@@ -200,13 +251,15 @@ def run_random_crop(
 
         for aug_i in range(n_aug_per_image):
             try:
-                transform = _crop_transform(h, w, crop_min_ratio, crop_max_ratio)
-                result = transform(image=img_rgb, masks=orig_masks)
+                if _use_albumentations:
+                    transform = _crop_transform_albumentations(h, w, crop_min_ratio, crop_max_ratio)
+                    result = transform(image=img_rgb, masks=orig_masks)
+                    aug_img = result["image"]
+                    aug_masks = result.get("masks", [])
+                else:
+                    aug_img, aug_masks = _run_crop_opencv(img_rgb, orig_masks, crop_min_ratio, crop_max_ratio)
             except Exception:
                 continue
-
-            aug_img = result["image"]
-            aug_masks = result.get("masks", [])
 
             new_anns = []
             for cls_id, aug_mask, orig_area in zip(class_ids, aug_masks, orig_areas):
@@ -241,6 +294,7 @@ def run_random_crop(
         "augmented": aug_saved,
         "total": orig_copied + aug_saved,
         "output_dir": str(out),
+        "backend": "albumentations" if _use_albumentations else "opencv",
     }
 
 
@@ -263,7 +317,7 @@ def run_filter_dataset(
     """Apply window filter to every image in a YOLO-seg dataset.
 
     When randomize=True each image gets a random center/width within the given ranges.
-    Labels are copied as-is (the filter changes only pixel values, not annotations).
+    Labels are copied as-is.
     """
     np.random.seed(seed)
 
@@ -329,5 +383,150 @@ def run_filter_dataset(
         "originals": orig_copied,
         "filtered": filtered_saved,
         "total": orig_copied + filtered_saved,
+        "output_dir": str(out),
+    }
+
+
+# ── Mixed preset augmentation ─────────────────────────────────────────
+
+def run_mixed_filter_augmentation(
+    dataset_dir: str,
+    output_dir: str,
+    augmentation_fraction: float = 0.20,
+    presets: list = None,
+    clahe_probability: float = 0.0,
+    copy_originals: bool = True,
+    merge_into_source: bool = False,
+    output_jpeg_quality: int = 100,
+    seed: int = 42,
+    progress_callback=None,
+) -> dict:
+    """Create a mixed augmentation dataset using weighted preset sampling.
+
+    presets: list of dicts, each with keys:
+        name (str), center (int), width (int), ratio (float)
+    ratios are normalized to sum to 1.0.
+
+    augmentation_fraction: fraction of original images to augment (0.0-1.0).
+    clahe_probability: probability [0-1] of applying CLAHE to each augmented image.
+    merge_into_source: if True, output goes directly into dataset_dir
+                       (the output_dir argument is ignored).
+
+    Returns result dict: originals, augmented, total, output_dir, error.
+    """
+    if presets is None or len(presets) == 0:
+        presets = [
+            {"name": "M2", "center": M2_PRESET[0], "width": M2_PRESET[1], "ratio": 0.5},
+            {"name": "M3", "center": M3_PRESET[0], "width": M3_PRESET[1], "ratio": 0.5},
+        ]
+
+    # Normalize ratios
+    total_ratio = sum(p.get("ratio", 1.0) for p in presets)
+    if total_ratio <= 0:
+        total_ratio = 1.0
+    norm_ratios = [p.get("ratio", 1.0) / total_ratio for p in presets]
+    cum_ratios = []
+    acc = 0.0
+    for r in norm_ratios:
+        acc += r
+        cum_ratios.append(acc)
+
+    rng = np.random.RandomState(seed)
+
+    ds = Path(dataset_dir)
+    if merge_into_source:
+        out = ds
+    else:
+        out = Path(output_dir)
+
+    img_in = ds / "images"
+    lbl_in = ds / "labels"
+    img_out = out / "images"
+    lbl_out = out / "labels"
+
+    for d in (img_out, lbl_out):
+        d.mkdir(parents=True, exist_ok=True)
+
+    image_paths = _collect_images(img_in)
+    if not image_paths:
+        return {"error": f"No images found in {img_in}"}
+
+    total_imgs = len(image_paths)
+    n_to_augment = max(1, int(round(total_imgs * augmentation_fraction)))
+    n_to_augment = min(n_to_augment, total_imgs)
+
+    selected_indices = rng.choice(total_imgs, size=n_to_augment, replace=False)
+    selected_paths = [image_paths[i] for i in selected_indices]
+
+    orig_copied = 0
+    aug_saved = 0
+
+    def _report(pct):
+        if progress_callback:
+            progress_callback(int(pct))
+
+    if copy_originals and not merge_into_source:
+        for i, p in enumerate(image_paths):
+            shutil.copy2(p, img_out / p.name)
+            lp = lbl_in / (p.stem + ".txt")
+            if lp.exists():
+                shutil.copy2(lp, lbl_out / lp.name)
+            orig_copied += 1
+            _report(i / total_imgs * 30)
+
+    start_pct = 30 if (copy_originals and not merge_into_source) else 0
+
+    for i, img_path in enumerate(selected_paths):
+        img = imread_unicode(img_path)
+        if img is None:
+            continue
+
+        # Pick preset by ratio
+        r = rng.random()
+        preset_idx = 0
+        for idx, cum in enumerate(cum_ratios):
+            if r <= cum:
+                preset_idx = idx
+                break
+        preset = presets[preset_idx]
+        center = preset["center"]
+        width = preset["width"]
+        preset_name = preset.get("name", f"p{preset_idx}")
+
+        use_clahe = rng.random() < clahe_probability
+
+        filtered = apply_filter(img, center, width, use_clahe)
+
+        clahe_tag = "_clahe" if use_clahe else ""
+        out_stem = f"{img_path.stem}_{preset_name}{clahe_tag}_aug"
+
+        # Avoid name collision
+        counter = 0
+        candidate = img_out / f"{out_stem}.jpg"
+        while candidate.exists():
+            counter += 1
+            candidate = img_out / f"{out_stem}_{counter}.jpg"
+        imwrite_unicode(candidate, filtered, output_jpeg_quality)
+
+        lbl_path = lbl_in / (img_path.stem + ".txt")
+        lbl_dest = lbl_out / (candidate.stem + ".txt")
+        if lbl_path.exists():
+            shutil.copy2(lbl_path, lbl_dest)
+        else:
+            lbl_dest.write_text("")
+
+        aug_saved += 1
+        _report(start_pct + int(i / n_to_augment * (100 - start_pct)))
+
+    for fname in ("data.yaml", "classes.txt"):
+        src = ds / fname
+        if src.exists() and not merge_into_source:
+            shutil.copy2(src, out / fname)
+
+    _report(100)
+    return {
+        "originals": orig_copied,
+        "augmented": aug_saved,
+        "total": orig_copied + aug_saved,
         "output_dir": str(out),
     }

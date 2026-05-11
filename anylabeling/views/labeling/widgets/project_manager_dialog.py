@@ -218,6 +218,7 @@ class ProjectManagerDialog(QDialog):
     """
 
     project_opened = pyqtSignal(str)
+    open_augmentation_for = pyqtSignal(str)  # emitted with dataset path
 
     def __init__(self, project_manager: ProjectManager, parent=None):
         super().__init__(parent)
@@ -329,10 +330,17 @@ class ProjectManagerDialog(QDialog):
         self.aug_merge_btn = QPushButton(self.tr("Merge into Project"))
         self.aug_merge_btn.setStyleSheet(get_ok_btn_style())
         self.aug_merge_btn.clicked.connect(self._on_aug_merge)
+        self.aug_open_aug_btn = QPushButton(self.tr("Open in Augmentation…"))
+        self.aug_open_aug_btn.setStyleSheet(get_cancel_btn_style())
+        self.aug_open_aug_btn.setToolTip(
+            self.tr("Open the selected augmentation dataset in the Data Augmentation dialog")
+        )
+        self.aug_open_aug_btn.clicked.connect(self._on_aug_open_augmentation)
         self.aug_delete_btn = QPushButton(self.tr("Delete Dataset"))
         self.aug_delete_btn.setStyleSheet(get_cancel_btn_style())
         self.aug_delete_btn.clicked.connect(self._on_aug_delete)
         aug_btn_row.addWidget(self.aug_merge_btn)
+        aug_btn_row.addWidget(self.aug_open_aug_btn)
         aug_btn_row.addWidget(self.aug_delete_btn)
         aug_btn_row.addStretch()
         aug_layout.addLayout(aug_btn_row)
@@ -485,6 +493,15 @@ class ProjectManagerDialog(QDialog):
             self.tr("Merged %d files. Skipped %d (already existed).") % (merged, skipped),
         )
         self._refresh()
+
+    def _on_aug_open_augmentation(self) -> None:
+        aug_path = self._selected_aug_path()
+        if not aug_path:
+            QMessageBox.information(
+                self, self.tr("No dataset selected"), self.tr("Select an augmentation dataset first.")
+            )
+            return
+        self.open_augmentation_for.emit(aug_path)
 
     def _on_aug_delete(self) -> None:
         aug_path = self._selected_aug_path()
