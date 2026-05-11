@@ -299,6 +299,10 @@ def main():
     loaded_language = translator.load(
         ":/languages/translations/" + language + ".qm"
     )
+    if not loaded_language:
+        import pathlib as _pathlib
+        _ts_dir = _pathlib.Path(__file__).parent / "resources" / "translations"
+        loaded_language = translator.load(str(_ts_dir / (language + ".qm")))
     QtCore.QCoreApplication.setAttribute(
         QtCore.Qt.ApplicationAttribute.AA_ShareOpenGLContexts
     )
