@@ -34,7 +34,6 @@ from PyQt6.QtWidgets import (
 
 from anylabeling.services.auto_labeling.types import AutoLabelingMode
 from anylabeling.services.auto_labeling import _THUMBNAIL_RENDER_MODELS
-from anylabeling.views.training import UltralyticsDialog
 
 from ...app_info import (
     __appname__,
@@ -69,6 +68,7 @@ from .utils.version_control import VersionManager
 from .widgets import (
     AboutDialog,
     AddImagesDialog,
+    AugmentationDialog,
     AutoLabelingWidget,
     BrightnessContrastDialog,
     Canvas,
@@ -1012,10 +1012,11 @@ class LabelingWidget(LabelDialog):
         )
         self.select_toggle_action = select_toggle_shapes
 
-        ultralytics_train = action(
-            "Ultralytics",
-            lambda: self.start_training("ultralytics"),
-            icon="ultralytics",
+        augmentation_action = action(
+            self.tr("Data Augmentation…"),
+            self.open_augmentation_dialog,
+            icon="color",
+            tip=self.tr("Open data augmentation dialog (random crop, window filter)"),
         )
 
         zoom = QtWidgets.QWidgetAction(self)
@@ -1234,6 +1235,15 @@ class LabelingWidget(LabelDialog):
             checkable=True,
             checked=self._config["language"] == "ko_KR",
             enabled=self._config["language"] != "ko_KR",
+        )
+
+        select_lang_tr = action(
+            "Türkçe",
+            functools.partial(self.set_language, "tr_TR"),
+            icon="us",
+            checkable=True,
+            checked=self._config["language"] == "tr_TR",
+            enabled=self._config["language"] != "tr_TR",
         )
 
         # Theme menu options (System / Light / Dark)
@@ -1776,6 +1786,7 @@ class LabelingWidget(LabelDialog):
             export_vlm_r1_ovd_annotation=export_vlm_r1_ovd_annotation,
             import_dataset=import_dataset,
             export_dataset=export_dataset,
+            augmentation_action=augmentation_action,
             split_management=split_management,
             version_control=version_control,
             add_images_action=add_images_action,
@@ -1936,10 +1947,7 @@ class LabelingWidget(LabelDialog):
             view=self.menu(self.tr("View")),
             theme=self.menu(self.tr("Theme")),
             language=self.menu(self.tr("Language")),
-            upload=self.menu(self.tr("Upload")),
-            export=self.menu(self.tr("Export")),
             tool=self.menu(self.tr("Tool")),
-            train=self.menu(self.tr("Train")),
             help=self.menu(self.tr("Help")),
             recent_files=QtWidgets.QMenu(self.tr("Open Recent")),
             label_list=label_menu,
@@ -1984,20 +1992,12 @@ class LabelingWidget(LabelDialog):
                 None,
             ),
         )
-        utils.add_actions(self.menus.train, (ultralytics_train,))
         utils.add_actions(
             self.menus.tool,
             (
                 overview,
                 None,
-                save_crop,
-                None,
-                digit_shortcut_manager,
-                label_manager,
-                gid_manager,
-                shape_manager,
-                None,
-                shape_converter,
+                augmentation_action,
                 None,
                 split_management,
                 version_control,
@@ -2018,72 +2018,10 @@ class LabelingWidget(LabelDialog):
             self.menus.language,
             (
                 select_lang_en,
-                select_lang_zh,
-                select_lang_jp,
-                select_lang_ko,
+                select_lang_tr,
             ),
         )
         utils.add_actions(self.menus.theme, theme_mode_actions)
-        utils.add_actions(
-            self.menus.upload,
-            (
-                upload_image_flags_file,
-                upload_label_flags_file,
-                upload_shape_attrs_file,
-                upload_label_classes_file,
-                None,
-                upload_yolo_hbb_annotation,
-                upload_yolo_obb_annotation,
-                upload_yolo_seg_annotation,
-                upload_yolo_pose_annotation,
-                None,
-                upload_voc_det_annotation,
-                upload_voc_seg_annotation,
-                None,
-                upload_coco_det_annotation,
-                upload_coco_seg_annotation,
-                upload_coco_pose_annotation,
-                None,
-                upload_dota_annotation,
-                upload_mask_annotation,
-                upload_mot_annotation,
-                upload_odvg_annotation,
-                upload_mmgd_annotation,
-                None,
-                upload_ppocr_rec_annotation,
-                upload_ppocr_kie_annotation,
-                None,
-                upload_vlm_r1_ovd_annotation,
-            ),
-        )
-        utils.add_actions(
-            self.menus.export,
-            (
-                export_yolo_hbb_annotation,
-                export_yolo_obb_annotation,
-                export_yolo_seg_annotation,
-                export_yolo_pose_annotation,
-                None,
-                export_voc_det_annotation,
-                export_voc_seg_annotation,
-                None,
-                export_coco_det_annotation,
-                export_coco_seg_annotation,
-                export_coco_pose_annotation,
-                None,
-                export_dota_annotation,
-                export_mask_annotation,
-                export_odvg_annotation,
-                None,
-                export_mot_annotation,
-                export_mots_annotation,
-                None,
-                export_pporc_rec_annotation,
-                export_pporc_kie_annotation,
-                None,
-                export_vlm_r1_ovd_annotation,
-            ),
-        )
         utils.add_actions(
             self.menus.view,
             (
@@ -2154,7 +2092,6 @@ class LabelingWidget(LabelDialog):
             create_mode,
             self.actions.create_brush_polygon_mode,
             self.actions.create_rectangle_mode,
-            self.actions.create_cuboid_mode,
             self.actions.create_rotation_mode,
             self.actions.create_quadrilateral_mode,
             self.actions.create_circle_mode,
@@ -2170,10 +2107,6 @@ class LabelingWidget(LabelDialog):
             select_toggle_shapes,
             run_all_images,
             toggle_auto_labeling_widget,
-            None,
-            open_chatbot,
-            open_vqa,
-            open_classifier,
             None,
             fit_width,
             zoom,
@@ -3104,6 +3037,7 @@ class LabelingWidget(LabelDialog):
     # Trainer
     def start_training(self, mode):
         if mode == "ultralytics":
+            from anylabeling.views.training import UltralyticsDialog
             dialog = UltralyticsDialog(self)
         else:
             return
@@ -6371,6 +6305,33 @@ class LabelingWidget(LabelDialog):
         dialog = ProjectManagerDialog(self.project_manager, parent=self)
         dialog.project_opened.connect(self._on_project_opened)
         dialog.exec()
+
+    def open_augmentation_dialog(self):
+        """Open the data augmentation dialog (random crop + window filter)."""
+        if not hasattr(self, "_augmentation_dialog") or self._augmentation_dialog is None:
+            dataset_dir = ""
+            if hasattr(self, "current_project") and self.current_project:
+                dataset_dir = self.project_manager.get_images_dir(self.current_project)
+                # Go up one level to the project root (parent of images/)
+                import os as _os
+                dataset_dir = str(_os.path.dirname(dataset_dir))
+            elif self.last_open_dir:
+                dataset_dir = self.last_open_dir
+            image_path = self.image_path or ""
+            self._augmentation_dialog = AugmentationDialog(
+                current_image_path=image_path,
+                dataset_dir=dataset_dir,
+                parent=self,
+            )
+            self._augmentation_dialog.setAttribute(
+                QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, False
+            )
+        else:
+            # Update with latest image/dataset info
+            if self.image_path:
+                self._augmentation_dialog.update_current_image(self.image_path)
+        self._augmentation_dialog.show()
+        self._augmentation_dialog.raise_()
 
     def _on_project_opened(self, project_path):
         """Handle opening of a project from the project manager dialog."""
