@@ -63,6 +63,7 @@ from .utils.file_search import (
     matches_label_attribute,
 )
 from .utils.project_manager import ProjectManager
+from .utils import review_manager as rm
 from .utils.split_manager import SplitManager
 from .utils.version_control import VersionManager
 from .widgets import (
@@ -93,6 +94,7 @@ from .widgets import (
     OverviewDialog,
     Popup,
     ProjectManagerDialog,
+    ReviewPanel,
     SearchBar,
     SplitManagerDialog,
     ToolBar,
@@ -330,12 +332,17 @@ class LabelingWidget(LabelDialog):
         self.file_list_widget.setDragDropMode(
             QtWidgets.QAbstractItemView.DragDropMode.DragOnly
         )
+        self.file_list_widget.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection
+        )
         self.file_list_widget.itemSelectionChanged.connect(
             self.file_selection_changed
         )
+        self.review_panel = ReviewPanel(host=self)
         file_list_layout = QtWidgets.QVBoxLayout()
         file_list_layout.setContentsMargins(0, 0, 0, 0)
         file_list_layout.setSpacing(0)
+        file_list_layout.addWidget(self.review_panel)
         file_list_layout.addWidget(self.file_list_widget)
         self.file_dock = QtWidgets.QDockWidget("", self)
         self.file_dock.setObjectName("Files")
@@ -4141,6 +4148,10 @@ class LabelingWidget(LabelDialog):
                 items[0].setCheckState(Qt.CheckState.Checked)
             # disable allows next and previous image to proceed
             # self.filename = filename
+            try:
+                self.refresh_review_states()
+            except Exception as exc:
+                logger.debug("refresh_review_states failed: %s", exc)
             return True
         except LabelFileError as e:
             self.error_message(
@@ -4485,6 +4496,10 @@ class LabelingWidget(LabelDialog):
                 items[0].setCheckState(Qt.CheckState.Checked)
             # disable allows next and previous image to proceed
             # self.filename = filename
+            try:
+                self.refresh_review_states()
+            except Exception as exc:
+                logger.debug("refresh_review_states failed: %s", exc)
             return True
         except LabelFileError as e:
             self.error_message(
@@ -6067,6 +6082,11 @@ class LabelingWidget(LabelDialog):
         if valid_files and self._config.get("exif_scan_enabled", True):
             self.async_exif_scanner.start_scan(valid_files)
 
+        try:
+            self.refresh_review_states()
+        except Exception as exc:
+            logger.debug("refresh_review_states failed: %s", exc)
+
     def import_image_folder(self, dirpath, pattern=None, load=True):
         if not self.may_continue() or not dirpath:
             return
@@ -6161,6 +6181,11 @@ class LabelingWidget(LabelDialog):
         except Exception as e:
             logger.warning("Failed to initialize version manager: %s", e)
             self.version_manager = None
+
+        try:
+            self.refresh_review_states()
+        except Exception as exc:
+            logger.debug("refresh_review_states failed: %s", exc)
 
     def open_split_management(self):
         """Open the split management dialog."""
@@ -6355,6 +6380,262 @@ class LabelingWidget(LabelDialog):
             self._augmentation_dialog.set_dataset_dir(dataset_path)
             self._augmentation_dialog.show()
             self._augmentation_dialog.raise_()
+
+    # ── Review / triage panel host methods ───────────────────────────
+
+    _REVIEW_COLORS = {
+        rm.TODO:     QtGui.QColor("#bbbbbb"),
+        rm.LABELED:  QtGui.QColor("#4da3ff"),
+        rm.NEGATIVE: QtGui.QColor("#e0a030"),
+        rm.APPROVED: QtGui.QColor("#46c46a"),
+    }
+
+    def _review_approved_keys(self) -> set:
+        if not getattr(self, "current_project", None):
+            return set()
+        try:
+            return self.project_manager.get_approved_set(self.current_project)
+        except Exception:
+            return set()
+
+    def _review_classify(self, image_path: str, approved_keys=None):
+        if approved_keys is None:
+            approved_keys = self._review_approved_keys()
+        return {
+            "base": rm.base_status(image_path, self.output_dir or ""),
+            "approved": rm.image_key(image_path) in approved_keys,
+        }
+
+    def _review_label_path(self, image_path: str) -> str:
+        return rm.label_path_for(image_path, self.output_dir or "")
+
+    def refresh_review_states(self) -> None:
+        """Recompute per-item status, recolor file list, update counts."""
+        if not hasattr(self, "review_panel"):
+            return
+        approved_keys = self._review_approved_keys()
+        counts = {rm.TODO: 0, rm.LABELED: 0, rm.NEGATIVE: 0, rm.APPROVED: 0}
+        for i in range(self.file_list_widget.count()):
+            item = self.file_list_widget.item(i)
+            path = item.text()
+            info = self._review_classify(path, approved_keys)
+            base = info["base"]
+            approved = info["approved"]
+            counts[base] = counts.get(base, 0) + 1
+            if approved:
+                counts[rm.APPROVED] = counts.get(rm.APPROVED, 0) + 1
+            display_status = rm.APPROVED if approved else base
+            color = self._REVIEW_COLORS.get(display_status)
+            if color is not None:
+                item.setForeground(QtGui.QBrush(color))
+            tip = f"{osp.basename(path)} — {display_status}"
+            if approved and base != rm.APPROVED:
+                tip += f" (base: {base})"
+            item.setToolTip(tip)
+            item.setData(Qt.ItemDataRole.UserRole + 7, display_status)
+        self.review_panel.update_counts(counts)
+        self.apply_review_filter(self.review_panel.current_filter())
+
+    def apply_review_filter(self, mode: str) -> None:
+        if not hasattr(self, "file_list_widget"):
+            return
+        for i in range(self.file_list_widget.count()):
+            item = self.file_list_widget.item(i)
+            status = item.data(Qt.ItemDataRole.UserRole + 7) or rm.TODO
+            hide = False
+            if mode == "all":
+                hide = False
+            elif mode == rm.APPROVED:
+                hide = status != rm.APPROVED
+            elif mode == "not_approved":
+                hide = status == rm.APPROVED
+            elif mode in (rm.TODO, rm.LABELED, rm.NEGATIVE):
+                hide = status != mode
+            item.setHidden(hide)
+
+    def _selected_or_current_paths(self) -> list:
+        items = self.file_list_widget.selectedItems()
+        if items:
+            return [it.text() for it in items]
+        if self.image_path:
+            return [self.image_path]
+        return []
+
+    def mark_selection_negative(self) -> None:
+        paths = self._selected_or_current_paths()
+        if not paths:
+            Popup(self.tr("No image selected."), self).show_popup(
+                self, position="center"
+            )
+            return
+        wrote = 0
+        skipped_labeled = 0
+        failed = 0
+        for p in paths:
+            base = rm.base_status(p, self.output_dir or "")
+            if base == rm.LABELED:
+                skipped_labeled += 1
+                continue
+            if base == rm.NEGATIVE:
+                continue  # already negative
+            try:
+                self._write_empty_label_for(p)
+                wrote += 1
+            except Exception as exc:
+                logger.warning("Mark negative failed for %s: %s", p, exc)
+                failed += 1
+        self.refresh_review_states()
+        # Reload current image so the user sees the empty-label state
+        if self.image_path and self.image_path in paths:
+            try:
+                self.load_file(self.image_path)
+            except Exception:
+                pass
+        msg_parts = []
+        if wrote:
+            msg_parts.append(self.tr("Marked %d as negative.") % wrote)
+        if skipped_labeled:
+            msg_parts.append(
+                self.tr("Skipped %d already-labeled.") % skipped_labeled
+            )
+        if failed:
+            msg_parts.append(self.tr("%d failed.") % failed)
+        if msg_parts:
+            self.review_panel.set_status("  ".join(msg_parts))
+
+    def _write_empty_label_for(self, image_path: str) -> None:
+        """Create a valid annotation file with zero shapes for ``image_path``."""
+        label_path = self._review_label_path(image_path)
+        if osp.exists(label_path):
+            return
+        os.makedirs(osp.dirname(label_path) or ".", exist_ok=True)
+        qimg = QtGui.QImage(image_path)
+        if qimg.isNull():
+            raise RuntimeError(f"Cannot read image: {image_path}")
+        w, h = qimg.width(), qimg.height()
+        rel_image = osp.relpath(image_path, osp.dirname(label_path))
+        LabelFile().save(
+            filename=label_path,
+            shapes=[],
+            image_path=rel_image,
+            image_height=h,
+            image_width=w,
+            image_data=None,
+            other_data={},
+            flags={},
+        )
+        items = self.file_list_widget.findItems(
+            image_path, Qt.MatchFlag.MatchExactly
+        )
+        for it in items:
+            it.setCheckState(Qt.CheckState.Checked)
+
+    def approve_selected_images(self) -> None:
+        paths = self._selected_or_current_paths()
+        self._approve_paths(paths)
+
+    def approve_all_reviewed(self) -> None:
+        approved_keys = self._review_approved_keys()
+        paths = []
+        for i in range(self.file_list_widget.count()):
+            item = self.file_list_widget.item(i)
+            p = item.text()
+            if rm.image_key(p) in approved_keys:
+                continue
+            base = rm.base_status(p, self.output_dir or "")
+            if base in (rm.LABELED, rm.NEGATIVE):
+                paths.append(p)
+        self._approve_paths(paths)
+
+    def _approve_paths(self, paths) -> None:
+        if not paths:
+            self.review_panel.set_status(self.tr("Nothing to approve."))
+            return
+        if not getattr(self, "current_project", None):
+            Popup(
+                self.tr(
+                    "No project is open. Open or create a project first "
+                    "so approved images can be copied into its dataset."
+                ),
+                self,
+            ).show_popup(self, position="center")
+            return
+
+        images_dir = self.project_manager.get_images_dir(self.current_project)
+        annotations_dir = self.project_manager.get_annotations_dir(
+            self.current_project
+        )
+        os.makedirs(images_dir, exist_ok=True)
+        os.makedirs(annotations_dir, exist_ok=True)
+
+        approved_keys = set(
+            self.project_manager.get_approved_set(self.current_project)
+        )
+        copied_img = 0
+        copied_lbl = 0
+        skipped_unreviewed = 0
+        already = 0
+        failed = 0
+        newly_approved = []
+
+        for path in paths:
+            key = rm.image_key(path)
+            base = rm.base_status(path, self.output_dir or "")
+            if base == rm.TODO:
+                skipped_unreviewed += 1
+                continue
+            if key in approved_keys and osp.exists(
+                osp.join(images_dir, key)
+            ):
+                already += 1
+                continue
+            try:
+                dst_img = osp.join(images_dir, key)
+                if osp.abspath(path) != osp.abspath(dst_img):
+                    if not osp.exists(dst_img):
+                        shutil.copy2(path, dst_img)
+                        copied_img += 1
+                lbl_src = self._review_label_path(path)
+                if osp.exists(lbl_src):
+                    dst_lbl = osp.join(
+                        annotations_dir,
+                        osp.splitext(key)[0] + ".json",
+                    )
+                    if osp.abspath(lbl_src) != osp.abspath(dst_lbl):
+                        if not osp.exists(dst_lbl):
+                            shutil.copy2(lbl_src, dst_lbl)
+                            copied_lbl += 1
+                approved_keys.add(key)
+                newly_approved.append(key)
+            except Exception as exc:
+                logger.warning("Approve failed for %s: %s", path, exc)
+                failed += 1
+
+        if newly_approved:
+            self.project_manager.set_approved_set(
+                self.current_project, approved_keys
+            )
+
+        self.refresh_review_states()
+        parts = []
+        if newly_approved:
+            parts.append(
+                self.tr("Approved %d images") % len(newly_approved)
+            )
+        if copied_img or copied_lbl:
+            parts.append(
+                self.tr("(copied %d images, %d labels)")
+                % (copied_img, copied_lbl)
+            )
+        if already:
+            parts.append(self.tr("%d already approved") % already)
+        if skipped_unreviewed:
+            parts.append(
+                self.tr("%d skipped (not yet labeled)") % skipped_unreviewed
+            )
+        if failed:
+            parts.append(self.tr("%d failed") % failed)
+        self.review_panel.set_status("  ·  ".join(parts) if parts else "")
 
     def open_augmentation_dialog(self):
         """Open the data augmentation dialog (random crop + window filter)."""

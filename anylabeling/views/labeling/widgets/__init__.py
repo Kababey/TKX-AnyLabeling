@@ -29,6 +29,7 @@ from .dataset_health_dialog import DatasetHealthDialog
 from .image_manager_dialog import AddImagesDialog
 from .popup import Popup
 from .project_manager_dialog import ProjectManagerDialog, NewProjectDialog
+from .review_panel import ReviewPanel
 from .split_dialog import SplitManagerDialog
 from .toolbar import ToolBar
 from .unique_label_qlist_widget import UniqueLabelQListWidget

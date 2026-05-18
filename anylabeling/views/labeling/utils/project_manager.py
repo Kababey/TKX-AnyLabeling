@@ -343,6 +343,32 @@ class ProjectManager:
         sub = project_info.paths.get("annotations_dir", "annotations")
         return osp.join(project_info.path, sub)
 
+    # ---- review manifest (approved samples) ----
+
+    def get_approved_set(self, project_info: ProjectInfo) -> set:
+        """Return the set of approved image filenames (basenames)."""
+        review = (project_info.settings or {}).get("review", {}) or {}
+        return set(review.get("approved", []) or [])
+
+    def set_approved_set(
+        self, project_info: ProjectInfo, keys
+    ) -> None:
+        """Replace the approved set and persist it."""
+        review = dict((project_info.settings or {}).get("review", {}) or {})
+        review["approved"] = sorted({str(k) for k in keys})
+        self.update_settings(project_info, {"review": review})
+
+    def add_approved(self, project_info: ProjectInfo, keys) -> None:
+        current = self.get_approved_set(project_info)
+        current.update(str(k) for k in keys)
+        self.set_approved_set(project_info, current)
+
+    def remove_approved(self, project_info: ProjectInfo, keys) -> None:
+        current = self.get_approved_set(project_info)
+        for k in keys:
+            current.discard(str(k))
+        self.set_approved_set(project_info, current)
+
     # ---- registry ----
 
     def _load_registry(self) -> Dict:
