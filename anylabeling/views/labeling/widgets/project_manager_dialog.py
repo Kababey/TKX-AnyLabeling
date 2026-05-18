@@ -37,6 +37,7 @@ from anylabeling.views.labeling.utils.project_manager import (
     ProjectInfo,
     ProjectManager,
 )
+from anylabeling.views.labeling.utils.project_sync import recount_project
 from anylabeling.views.labeling.utils.style import (
     get_cancel_btn_style,
     get_dialog_style,
@@ -259,11 +260,12 @@ class ProjectManagerDialog(QDialog):
         layout.addLayout(actions_row)
 
         # Recent projects table
-        self.table = QTableWidget(0, 5)
+        self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels([
             self.tr("Name"),
             self.tr("Path"),
             self.tr("Images"),
+            self.tr("Annotated"),
             self.tr("Classes"),
             self.tr("Last opened"),
         ])
@@ -290,6 +292,9 @@ class ProjectManagerDialog(QDialog):
         )
         self.table.horizontalHeader().setSectionResizeMode(
             4, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            5, QHeaderView.ResizeMode.ResizeToContents
         )
         self.table.doubleClicked.connect(self._on_open_selected)
         self.table.itemSelectionChanged.connect(self._refresh_aug_panel)
@@ -376,15 +381,27 @@ class ProjectManagerDialog(QDialog):
             last = entry.get("last_opened", "")
             exists = entry.get("exists", False)
 
-            # Try to load current stats / class count
+            # Compute live counts from disk (robust to stale stats),
+            # falling back to persisted stats if scanning fails.
             image_count = "?"
+            annotated_count = "?"
             class_count = "?"
             if exists:
                 try:
                     info = self._pm.load_project(path)
-                    stats = info.stats or {}
-                    image_count = str(stats.get("image_count", "?"))
                     class_count = str(len(info.classes or []))
+                    images_dir = self._pm.get_images_dir(info)
+                    annotations_dir = self._pm.get_annotations_dir(info)
+                    try:
+                        counts = recount_project(images_dir, annotations_dir)
+                        image_count = str(counts["image_count"])
+                        annotated_count = str(counts["annotated_count"])
+                    except Exception:
+                        stats = info.stats or {}
+                        image_count = str(stats.get("image_count", "?"))
+                        annotated_count = str(
+                            stats.get("annotated_count", "?")
+                        )
                 except ValueError:
                     exists = False
 
@@ -398,8 +415,9 @@ class ProjectManagerDialog(QDialog):
             self.table.setItem(row, 0, name_item)
             self.table.setItem(row, 1, QTableWidgetItem(path))
             self.table.setItem(row, 2, QTableWidgetItem(image_count))
-            self.table.setItem(row, 3, QTableWidgetItem(class_count))
-            self.table.setItem(row, 4, QTableWidgetItem(last))
+            self.table.setItem(row, 3, QTableWidgetItem(annotated_count))
+            self.table.setItem(row, 4, QTableWidgetItem(class_count))
+            self.table.setItem(row, 5, QTableWidgetItem(last))
 
         if entries:
             self.table.selectRow(0)

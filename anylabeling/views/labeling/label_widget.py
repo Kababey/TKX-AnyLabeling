@@ -64,6 +64,7 @@ from .utils.file_search import (
 )
 from .utils.project_manager import ProjectManager
 from .utils import review_manager as rm
+from .utils.project_sync import recount_project, sync_project_yolo_labels
 from .utils.split_manager import SplitManager
 from .utils.version_control import VersionManager
 from .widgets import (
@@ -4152,6 +4153,10 @@ class LabelingWidget(LabelDialog):
                 self.refresh_review_states()
             except Exception as exc:
                 logger.debug("refresh_review_states failed: %s", exc)
+            try:
+                self._recount_and_persist_stats()
+            except Exception as exc:
+                logger.debug("recount stats failed: %s", exc)
             return True
         except LabelFileError as e:
             self.error_message(
@@ -4500,6 +4505,10 @@ class LabelingWidget(LabelDialog):
                 self.refresh_review_states()
             except Exception as exc:
                 logger.debug("refresh_review_states failed: %s", exc)
+            try:
+                self._recount_and_persist_stats()
+            except Exception as exc:
+                logger.debug("recount stats failed: %s", exc)
             return True
         except LabelFileError as e:
             self.error_message(
@@ -6615,6 +6624,10 @@ class LabelingWidget(LabelDialog):
             self.project_manager.set_approved_set(
                 self.current_project, approved_keys
             )
+            # Approved labels feed augmentation → keep stats + YOLO
+            # labels/ in sync with what was just added.
+            self._recount_and_persist_stats()
+            self._sync_project_yolo_labels()
 
         self.refresh_review_states()
         parts = []
@@ -6639,15 +6652,17 @@ class LabelingWidget(LabelDialog):
 
     def open_augmentation_dialog(self):
         """Open the data augmentation dialog (random crop + window filter)."""
+        dataset_dir = ""
+        if getattr(self, "current_project", None):
+            # Ensure labels/ reflects the *current* annotations (incl.
+            # newly labelled images) before augmenting.
+            self._recount_and_persist_stats()
+            self._sync_project_yolo_labels()
+            dataset_dir = self.current_project.path
+        elif self.last_open_dir:
+            dataset_dir = self.last_open_dir
+
         if not hasattr(self, "_augmentation_dialog") or self._augmentation_dialog is None:
-            dataset_dir = ""
-            if hasattr(self, "current_project") and self.current_project:
-                dataset_dir = self.project_manager.get_images_dir(self.current_project)
-                # Go up one level to the project root (parent of images/)
-                import os as _os
-                dataset_dir = str(_os.path.dirname(dataset_dir))
-            elif self.last_open_dir:
-                dataset_dir = self.last_open_dir
             image_path = self.image_path or ""
             self._augmentation_dialog = AugmentationDialog(
                 current_image_path=image_path,
@@ -6659,6 +6674,8 @@ class LabelingWidget(LabelDialog):
             )
         else:
             # Update with latest image/dataset info
+            if dataset_dir:
+                self._augmentation_dialog.set_dataset_dir(dataset_dir)
             if self.image_path:
                 self._augmentation_dialog.update_current_image(self.image_path)
         self._augmentation_dialog.show()
@@ -6700,6 +6717,9 @@ class LabelingWidget(LabelDialog):
 
         self.setWindowTitle(f"X-AnyLabeling - {info.name}")
         self._update_project_status_bar()
+        # Bring stats up to date with what's actually on disk so the
+        # Project Manager / status bar reflect reality immediately.
+        self._recount_and_persist_stats()
 
     def close_current_project(self):
         """Close the active project (does not delete any files)."""
@@ -6753,6 +6773,58 @@ class LabelingWidget(LabelDialog):
             )
         else:
             self._project_status_label.setText("")
+
+    # ── Project completeness: stats + YOLO label sync ────────────────
+
+    def _recount_and_persist_stats(self):
+        """Recompute image/annotated/shape counts from disk and persist
+        them into the project config so the Project Manager and status
+        bar stay accurate."""
+        proj = getattr(self, "current_project", None)
+        if not proj:
+            return
+        try:
+            images_dir = self.project_manager.get_images_dir(proj)
+            annotations_dir = self.project_manager.get_annotations_dir(proj)
+            counts = recount_project(images_dir, annotations_dir)
+            cur = proj.stats or {}
+            if (
+                cur.get("image_count") == counts["image_count"]
+                and cur.get("annotated_count") == counts["annotated_count"]
+                and cur.get("total_shapes") == counts["total_shapes"]
+            ):
+                return  # nothing changed → avoid needless disk writes
+            self.project_manager.update_stats(
+                proj,
+                counts["image_count"],
+                counts["annotated_count"],
+                counts["total_shapes"],
+            )
+            self._update_project_status_bar()
+        except Exception as exc:
+            logger.debug("recount/persist stats failed: %s", exc)
+
+    def _sync_project_yolo_labels(self):
+        """Regenerate the project's YOLO labels/ from annotations/ so
+        augmentation always sees the latest (and all) labelled images."""
+        proj = getattr(self, "current_project", None)
+        if not proj:
+            return None
+        try:
+            result = sync_project_yolo_labels(
+                project_root=proj.path,
+                images_subdir=proj.paths.get("images_dir", "images"),
+                annotations_subdir=proj.paths.get(
+                    "annotations_dir", "annotations"
+                ),
+                project_classes=proj.classes,
+            )
+            if "error" in result:
+                logger.warning("YOLO label sync: %s", result["error"])
+            return result
+        except Exception as exc:
+            logger.debug("YOLO label sync failed: %s", exc)
+            return None
 
     def toggle_auto_labeling_widget(self):
         """Toggle auto labeling widget visibility."""
