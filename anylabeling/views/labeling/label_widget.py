@@ -106,6 +106,26 @@ LABEL_COLORMAP = utils.label_colormap()
 LABEL_OPACITY = 128
 
 
+class _DraggableImageListWidget(QtWidgets.QListWidget):
+    """File list whose items can be dragged out as file paths.
+
+    The dragged payload carries both a local-file URL and the plain
+    path text so external drop targets (e.g. the augmentation preview)
+    can load the image by path.
+    """
+
+    def mimeData(self, items):
+        mime = super().mimeData(items)
+        if items:
+            path = items[0].text()
+            mime.setText(path)
+            try:
+                mime.setUrls([QtCore.QUrl.fromLocalFile(path)])
+            except Exception:
+                pass
+        return mime
+
+
 class LabelingWidget(LabelDialog):
     """The main widget for labeling images"""
 
@@ -305,7 +325,11 @@ class LabelingWidget(LabelDialog):
         self.settings_button.setIconSize(QtCore.QSize(28, 28))
         self.settings_button.setStyleSheet(get_settings_button_style())
         self.settings_button.clicked.connect(self.open_settings_dialog)
-        self.file_list_widget = QtWidgets.QListWidget()
+        self.file_list_widget = _DraggableImageListWidget()
+        self.file_list_widget.setDragEnabled(True)
+        self.file_list_widget.setDragDropMode(
+            QtWidgets.QAbstractItemView.DragDropMode.DragOnly
+        )
         self.file_list_widget.itemSelectionChanged.connect(
             self.file_selection_changed
         )

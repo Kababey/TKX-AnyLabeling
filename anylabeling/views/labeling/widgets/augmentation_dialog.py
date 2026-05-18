@@ -433,6 +433,7 @@ class _FilterTab(QWidget):
         self._current_image_path = current_image_path
         self._bgr_image = None
         self._worker = None
+        self.setAcceptDrops(True)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -449,6 +450,14 @@ class _FilterTab(QWidget):
 
         self._preview = _PreviewPanel()
         pv.addWidget(self._preview)
+
+        drop_hint = QLabel(
+            "Tip: drag an image from the Files list (bottom-right of the "
+            "main window) and drop it here to preview it."
+        )
+        drop_hint.setWordWrap(True)
+        drop_hint.setStyleSheet("color:#888; font-style:italic;")
+        pv.addWidget(drop_hint)
 
         load_row = QHBoxLayout()
         load_row.addWidget(QLabel("Image:"))
@@ -666,12 +675,14 @@ class _FilterTab(QWidget):
         mx.addWidget(QLabel("Preset mix (each row: name, center, width, ratio):"))
         self.mix_table = QTableWidget(0, 4)
         self.mix_table.setHorizontalHeaderLabels(["Name", "Center", "Width", "Ratio"])
-        self.mix_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.mix_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.mix_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.mix_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.mix_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        self.mix_table.setMaximumHeight(140)
+        self.mix_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.mix_table.verticalHeader().setVisible(False)
         self.mix_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.mix_table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._mix_table_expanded = True
         mx.addWidget(self.mix_table)
 
         table_btn_row = QHBoxLayout()
@@ -684,9 +695,13 @@ class _FilterTab(QWidget):
         reset_preset_btn = QPushButton("Reset to Defaults")
         reset_preset_btn.setStyleSheet(get_cancel_btn_style())
         reset_preset_btn.clicked.connect(self._reset_mix_presets)
+        self._mix_table_toggle_btn = QPushButton("Compact view")
+        self._mix_table_toggle_btn.setStyleSheet(get_cancel_btn_style())
+        self._mix_table_toggle_btn.clicked.connect(self._toggle_mix_table_view)
         table_btn_row.addWidget(add_preset_btn)
         table_btn_row.addWidget(remove_preset_btn)
         table_btn_row.addWidget(reset_preset_btn)
+        table_btn_row.addWidget(self._mix_table_toggle_btn)
         table_btn_row.addStretch()
         mx.addLayout(table_btn_row)
 
@@ -795,6 +810,46 @@ class _FilterTab(QWidget):
         """Called by parent when the user opens a new image in the main window."""
         if image_path and Path(image_path).exists():
             self._load_image(image_path)
+
+    # ── drag & drop image loading ────────────────────────────────────
+
+    _IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp")
+
+    def _extract_dropped_image(self, mime) -> str:
+        candidates = []
+        if mime.hasUrls():
+            candidates.extend(
+                u.toLocalFile() for u in mime.urls() if u.isLocalFile()
+            )
+        if mime.hasText():
+            candidates.append(mime.text().strip())
+        for cand in candidates:
+            if not cand:
+                continue
+            p = Path(cand)
+            if p.exists() and p.suffix.lower() in self._IMAGE_EXTS:
+                return str(p)
+        return ""
+
+    def dragEnterEvent(self, event):
+        if self._extract_dropped_image(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if self._extract_dropped_image(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        path = self._extract_dropped_image(event.mimeData())
+        if path:
+            self._load_image(path)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
 
     # ── per-image filter config ──────────────────────────────────────
 
@@ -1024,16 +1079,40 @@ class _FilterTab(QWidget):
         r_spin.setDecimals(2)
         r_spin.setValue(float(ratio))
         self.mix_table.setCellWidget(row, 3, r_spin)
+        self._update_mix_table_height()
 
     def _remove_mix_preset_row(self):
         row = self.mix_table.currentRow()
         if row >= 0:
             self.mix_table.removeRow(row)
+        self._update_mix_table_height()
 
     def _reset_mix_presets(self):
         self.mix_table.setRowCount(0)
         self._add_mix_preset_row("M2", M2_PRESET[0], M2_PRESET[1], 0.5)
         self._add_mix_preset_row("M3", M3_PRESET[0], M3_PRESET[1], 0.5)
+
+    def _toggle_mix_table_view(self):
+        self._mix_table_expanded = not self._mix_table_expanded
+        self._mix_table_toggle_btn.setText(
+            "Compact view" if self._mix_table_expanded else "Show all rows"
+        )
+        self._update_mix_table_height()
+
+    def _update_mix_table_height(self):
+        """Size the preset table so every row is visible (expanded) or
+        keep a compact, scrollable height."""
+        rows = self.mix_table.rowCount()
+        header_h = self.mix_table.horizontalHeader().height()
+        row_h = self.mix_table.verticalHeader().defaultSectionSize()
+        if self._mix_table_expanded:
+            total = header_h + row_h * max(rows, 1) + 4
+            self.mix_table.setMinimumHeight(total)
+            self.mix_table.setMaximumHeight(total)
+        else:
+            compact = header_h + row_h * min(max(rows, 1), 3) + 4
+            self.mix_table.setMinimumHeight(compact)
+            self.mix_table.setMaximumHeight(compact)
 
     def _collect_mix_presets(self):
         presets = []
@@ -1129,6 +1208,7 @@ class AugmentationDialog(QDialog):
             self.windowFlags() & ~Qt.WindowType.WindowContextHelpButtonHint
         )
         self.setStyleSheet(get_dialog_style())
+        self.setAcceptDrops(True)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -1151,6 +1231,27 @@ class AugmentationDialog(QDialog):
         close_btn.clicked.connect(self.close)
         close_row.addWidget(close_btn)
         layout.addLayout(close_row)
+
+    def dragEnterEvent(self, event):
+        if self._filter_tab._extract_dropped_image(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if self._filter_tab._extract_dropped_image(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        path = self._filter_tab._extract_dropped_image(event.mimeData())
+        if path:
+            self._tabs.setCurrentWidget(self._filter_tab)
+            self._filter_tab._load_image(path)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
 
     def update_current_image(self, image_path: str):
         """Propagate the currently open image to the filter preview."""
