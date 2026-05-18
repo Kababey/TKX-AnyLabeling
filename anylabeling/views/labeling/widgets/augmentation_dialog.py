@@ -66,7 +66,12 @@ class _CropWorker(QThread):
         self._params = params
 
     def run(self):
-        result = run_random_crop(**self._params, progress_callback=self.progress.emit)
+        try:
+            result = run_random_crop(
+                **self._params, progress_callback=self.progress.emit
+            )
+        except Exception as exc:  # never crash the GUI thread
+            result = {"error": f"{type(exc).__name__}: {exc}"}
         self.finished.emit(result)
 
 
@@ -306,6 +311,16 @@ class _RandomCropTab(QWidget):
         pg = params_sec.content_layout()
         pg.setSpacing(6)
 
+        self._pct_row, self.pct_spin = _int_row(
+            "Data to crop (% of labelled):", 1, 100, 30
+        )
+        self.pct_spin.setToolTip(
+            "Randomly pick this percentage of LABELLED images for cropping.\n"
+            "Empty images (negative samples / no labels) are never cropped,\n"
+            "but are still copied as originals if that option is enabled."
+        )
+        pg.addWidget(self._pct_row)
+
         self._n_row, self.n_spin = _int_row("Augmentations per image:", 1, 50, 1)
         pg.addWidget(self._n_row)
 
@@ -393,6 +408,7 @@ class _RandomCropTab(QWidget):
             "min_mask_ratio": self.min_mask_spin.value(),
             "copy_originals": self.copy_orig_cb.isChecked(),
             "output_jpeg_quality": self.quality_spin.value(),
+            "data_fraction": self.pct_spin.value() / 100.0,
             "seed": self.seed_spin.value(),
         }
 
@@ -414,13 +430,23 @@ class _RandomCropTab(QWidget):
             QMessageBox.critical(self, "Augmentation Error", result["error"])
         else:
             backend = result.get("backend", "opencv")
+            sel_line = ""
+            if "eligible" in result:
+                sel_line = (
+                    f"Labelled images: {result.get('eligible', 0)} | "
+                    f"Selected for crop: {result.get('selected', 0)}\n"
+                )
+            note = result.get("note")
             msg = (
                 f"Done! Originals: {result['originals']} | "
                 f"Augmented: {result['augmented']} | "
                 f"Total: {result['total']}\n"
+                f"{sel_line}"
                 f"Output: {result['output_dir']}\n"
                 f"Backend: {backend}"
             )
+            if note:
+                msg += f"\nNote: {note}"
             self.status_label.setText(msg)
             QMessageBox.information(self, "Complete", msg)
 

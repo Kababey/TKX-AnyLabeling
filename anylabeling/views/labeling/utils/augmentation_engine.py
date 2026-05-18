@@ -256,19 +256,33 @@ def delete_image_filter_config(image_path: str) -> None:
 # ── YOLO segmentation I/O ─────────────────────────────────────────────
 
 def read_yolo_seg(label_path: Path):
-    """Returns list of (class_id, [(x_norm, y_norm), ...])."""
+    """Returns list of (class_id, [(x_norm, y_norm), ...]).
+
+    Tolerant of malformed lines: bad rows are skipped rather than raising.
+    """
     annotations = []
     if not label_path.exists():
         return annotations
-    for line in label_path.read_text(encoding="utf-8").strip().splitlines():
+    try:
+        text = label_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return annotations
+    for line in text.strip().splitlines():
         parts = line.strip().split()
         if len(parts) < 7:
             continue
-        cls = int(parts[0])
-        coords = list(map(float, parts[1:]))
+        try:
+            cls = int(float(parts[0]))
+            coords = list(map(float, parts[1:]))
+        except (TypeError, ValueError):
+            continue
         pts = list(zip(coords[0::2], coords[1::2]))
-        if pts and pts[0] == pts[-1] and len(pts) > 1:
+        if len(pts) < 3:
+            continue
+        if pts[0] == pts[-1] and len(pts) > 1:
             pts = pts[:-1]
+        if len(pts) < 3:
+            continue
         annotations.append((cls, pts))
     return annotations
 
@@ -281,14 +295,27 @@ def write_yolo_seg(label_path: Path, annotations):
 
 
 def poly_to_mask(pts, h: int, w: int) -> np.ndarray:
-    arr = np.array([[round(x * w), round(y * h)] for x, y in pts], dtype=np.int32)
     mask = np.zeros((h, w), dtype=np.uint8)
+    if not pts or len(pts) < 3:
+        return mask
+    try:
+        arr = np.array(
+            [[round(x * w), round(y * h)] for x, y in pts], dtype=np.int32
+        )
+    except (TypeError, ValueError):
+        return mask
+    if arr.ndim != 2 or arr.shape[0] < 3:
+        return mask
     cv2.fillPoly(mask, [arr], 1)
     return mask
 
 
 def mask_to_poly(mask: np.ndarray):
+    if mask is None or mask.ndim != 2 or mask.size == 0:
+        return None
     h, w = mask.shape
+    if h == 0 or w == 0:
+        return None
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return None
@@ -344,111 +371,174 @@ def run_random_crop(
     min_mask_ratio: float = 0.10,
     copy_originals: bool = True,
     output_jpeg_quality: int = 100,
+    data_fraction: float = 1.0,
     seed: int = 42,
     progress_callback=None,
 ) -> dict:
     """Run random-crop augmentation on a YOLO-seg dataset folder.
 
-    Uses albumentations if available; falls back to pure OpenCV otherwise.
-    Returns a result dict with keys: originals, augmented, total, output_dir, error.
+    - ``data_fraction``: portion (0-1) of *labelled* images randomly
+      selected for cropping. Empty images (no label file or zero
+      annotations / negative samples) are never cropped.
+    - Uses albumentations if available; falls back to pure OpenCV.
+    - Fully crash-safe: any failure returns ``{"error": ...}`` and a
+      single bad image/crop is skipped rather than aborting the run.
+
+    Returns a result dict with keys:
+    originals, augmented, total, eligible, selected, output_dir, error.
     """
-    _use_albumentations = False
     try:
-        import albumentations  # noqa
-        _use_albumentations = True
-    except ImportError:
-        pass  # use pure OpenCV fallback
+        _use_albumentations = False
+        try:
+            import albumentations  # noqa
+            _use_albumentations = True
+        except ImportError:
+            pass  # use pure OpenCV fallback
 
-    np.random.seed(seed)
+        rng = np.random.RandomState(int(seed) & 0x7FFFFFFF)
 
-    ds = Path(dataset_dir)
-    out = Path(output_dir)
-    img_in = ds / "images"
-    lbl_in = ds / "labels"
-    img_out = out / "images"
-    lbl_out = out / "labels"
+        ds = Path(dataset_dir)
+        out = Path(output_dir)
+        img_in = ds / "images"
+        lbl_in = ds / "labels"
+        img_out = out / "images"
+        lbl_out = out / "labels"
 
-    for d in (img_out, lbl_out):
-        d.mkdir(parents=True, exist_ok=True)
+        if not img_in.is_dir():
+            return {"error": f"No 'images' folder found in {ds}"}
 
-    image_paths = _collect_images(img_in)
-    if not image_paths:
-        return {"error": f"No images found in {img_in}"}
+        for d in (img_out, lbl_out):
+            d.mkdir(parents=True, exist_ok=True)
 
-    total = len(image_paths)
-    orig_copied = 0
-    aug_saved = 0
+        image_paths = _collect_images(img_in)
+        if not image_paths:
+            return {"error": f"No images found in {img_in}"}
 
-    def _report(pct):
-        if progress_callback:
-            progress_callback(int(pct))
+        total = len(image_paths)
+        orig_copied = 0
+        aug_saved = 0
 
-    if copy_originals:
-        for i, p in enumerate(image_paths):
-            shutil.copy2(p, img_out / p.name)
-            lp = lbl_in / (p.stem + ".txt")
-            if lp.exists():
-                shutil.copy2(lp, lbl_out / lp.name)
-            orig_copied += 1
-            _report(i / total * 30)
+        def _report(pct):
+            if progress_callback:
+                try:
+                    progress_callback(int(max(0, min(100, pct))))
+                except Exception:
+                    pass
 
-    for i, img_path in enumerate(image_paths):
-        img_bgr = imread_unicode(img_path)
-        if img_bgr is None:
-            continue
-        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        h, w = img_rgb.shape[:2]
+        # ── Copy originals (all images, regardless of labels) ──────
+        if copy_originals:
+            for i, p in enumerate(image_paths):
+                try:
+                    shutil.copy2(p, img_out / p.name)
+                    lp = lbl_in / (p.stem + ".txt")
+                    if lp.exists():
+                        shutil.copy2(lp, lbl_out / lp.name)
+                    orig_copied += 1
+                except Exception:
+                    pass
+                _report(i / total * 25)
 
-        lbl_path = lbl_in / (img_path.stem + ".txt")
-        annotations = read_yolo_seg(lbl_path)
-        class_ids = [c for c, _ in annotations]
-        orig_masks = [poly_to_mask(pts, h, w) for _, pts in annotations]
-        orig_areas = [int(m.sum()) for m in orig_masks]
+        # ── Determine eligible (non-empty) images ──────────────────
+        eligible = []
+        for p in image_paths:
+            anns = read_yolo_seg(lbl_in / (p.stem + ".txt"))
+            if anns:  # has at least one valid polygon → not a negative
+                eligible.append((p, anns))
 
-        for aug_i in range(n_aug_per_image):
+        if not eligible:
+            ensure_dataset_files(ds, out)
+            _report(100)
+            return {
+                "originals": orig_copied,
+                "augmented": 0,
+                "total": orig_copied,
+                "eligible": 0,
+                "selected": 0,
+                "output_dir": str(out),
+                "backend": "albumentations" if _use_albumentations else "opencv",
+                "note": "No labelled images to crop (all empty/negative).",
+            }
+
+        # ── Randomly select the requested fraction ─────────────────
+        frac = max(0.0, min(1.0, float(data_fraction)))
+        n_select = max(1, int(round(len(eligible) * frac))) if frac > 0 else 0
+        n_select = min(n_select, len(eligible))
+        sel_idx = rng.choice(len(eligible), size=n_select, replace=False)
+        selected = [eligible[k] for k in sorted(sel_idx.tolist())]
+
+        # ── Crop selected images ───────────────────────────────────
+        for i, (img_path, annotations) in enumerate(selected):
             try:
-                if _use_albumentations:
-                    transform = _crop_transform_albumentations(h, w, crop_min_ratio, crop_max_ratio)
-                    result = transform(image=img_rgb, masks=orig_masks)
-                    aug_img = result["image"]
-                    aug_masks = result.get("masks", [])
-                else:
-                    aug_img, aug_masks = _run_crop_opencv(img_rgb, orig_masks, crop_min_ratio, crop_max_ratio)
+                img_bgr = imread_unicode(img_path)
+                if img_bgr is None:
+                    continue
+                if img_bgr.ndim == 2:
+                    img_bgr = cv2.cvtColor(img_bgr, cv2.COLOR_GRAY2BGR)
+                elif img_bgr.ndim == 3 and img_bgr.shape[2] == 4:
+                    img_bgr = cv2.cvtColor(img_bgr, cv2.COLOR_BGRA2BGR)
+                img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+                h, w = img_rgb.shape[:2]
+
+                class_ids = [c for c, _ in annotations]
+                orig_masks = [poly_to_mask(pts, h, w) for _, pts in annotations]
+                orig_areas = [int(m.sum()) for m in orig_masks]
             except Exception:
                 continue
 
-            new_anns = []
-            for cls_id, aug_mask, orig_area in zip(class_ids, aug_masks, orig_areas):
-                if orig_area == 0:
+            for aug_i in range(max(1, int(n_aug_per_image))):
+                try:
+                    if _use_albumentations:
+                        transform = _crop_transform_albumentations(
+                            h, w, crop_min_ratio, crop_max_ratio
+                        )
+                        result = transform(image=img_rgb, masks=orig_masks)
+                        aug_img = result["image"]
+                        aug_masks = result.get("masks", [])
+                    else:
+                        aug_img, aug_masks = _run_crop_opencv(
+                            img_rgb, orig_masks, crop_min_ratio, crop_max_ratio
+                        )
+
+                    new_anns = []
+                    for cls_id, aug_mask, orig_area in zip(
+                        class_ids, aug_masks, orig_areas
+                    ):
+                        if orig_area == 0:
+                            continue
+                        if int(aug_mask.sum()) / orig_area < min_mask_ratio:
+                            continue
+                        pts = mask_to_poly(aug_mask)
+                        if pts is None or len(pts) < 3:
+                            continue
+                        new_anns.append((cls_id, pts))
+
+                    out_stem = f"{img_path.stem}_crop{aug_i + 1}"
+                    imwrite_unicode(
+                        img_out / f"{out_stem}.jpg",
+                        cv2.cvtColor(aug_img, cv2.COLOR_RGB2BGR),
+                        output_jpeg_quality,
+                    )
+                    write_yolo_seg(lbl_out / f"{out_stem}.txt", new_anns)
+                    aug_saved += 1
+                except Exception:
                     continue
-                if aug_mask.sum() / orig_area < min_mask_ratio:
-                    continue
-                pts = mask_to_poly(aug_mask)
-                if pts is None or len(pts) < 3:
-                    continue
-                new_anns.append((cls_id, pts))
 
-            out_stem = f"{img_path.stem}_crop{aug_i + 1}"
-            imwrite_unicode(
-                img_out / f"{out_stem}.jpg",
-                cv2.cvtColor(aug_img, cv2.COLOR_RGB2BGR),
-                output_jpeg_quality,
-            )
-            write_yolo_seg(lbl_out / f"{out_stem}.txt", new_anns)
-            aug_saved += 1
+            _report(25 + (i + 1) / len(selected) * 70)
 
-        _report(30 + i / total * 70)
+        ensure_dataset_files(ds, out)
 
-    ensure_dataset_files(ds, out)
-
-    _report(100)
-    return {
-        "originals": orig_copied,
-        "augmented": aug_saved,
-        "total": orig_copied + aug_saved,
-        "output_dir": str(out),
-        "backend": "albumentations" if _use_albumentations else "opencv",
-    }
+        _report(100)
+        return {
+            "originals": orig_copied,
+            "augmented": aug_saved,
+            "total": orig_copied + aug_saved,
+            "eligible": len(eligible),
+            "selected": len(selected),
+            "output_dir": str(out),
+            "backend": "albumentations" if _use_albumentations else "opencv",
+        }
+    except Exception as exc:  # never let the worker thread crash the app
+        return {"error": f"{type(exc).__name__}: {exc}"}
 
 
 # ── Window filter dataset processing ──────────────────────────────────
